@@ -1707,6 +1707,14 @@ fn build_connector(
     #[cfg(not(feature = "udp"))]
     let _ = enable_udp;
 
+    // MS-RDPEGFX 1.5.1: the graphics pipeline must be advertised or the server keeps
+    // graphics on the legacy bitmap path, which rides the main TCP connection and
+    // cannot migrate to UDP. IRONRDP_EGFX=1 advertises it (an EGFX processor is
+    // registered above); it stays off unless asked, matching upstream's default.
+    if std::env::var("IRONRDP_EGFX").map(|v| v == "1").unwrap_or(false) {
+        connector_config.support_dyn_vc_gfx_protocol = true;
+    }
+
     // If sound is disabled at runtime (or the feature is off) ensure the connector doesn't
     // advertise audio support, which would confuse the server.
     #[cfg(not(feature = "sound"))]
