@@ -49,6 +49,7 @@ const READ_BUF_HIGH_WATER: usize = 1 << 20;
 
 /// The driver task's internal state.
 pub(crate) struct Driver {
+    tx_logged: u32,
     socket: UdpSocket,
     conn: RdpeudpConnection,
     shared: Arc<Mutex<SharedIo>>,
@@ -75,6 +76,7 @@ impl Driver {
         connected_notify: Arc<Notify>,
     ) -> Self {
         Self {
+            tx_logged: 0,
             socket,
             conn,
             shared,
@@ -124,6 +126,8 @@ impl Driver {
     async fn run_to_completion(&mut self) -> Result<(), DriverError> {
         // Send any initial transmits (the SYN packet for client-side connections)
         self.drain_transmits().await?;
+        let mut stats_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut rx_logged = 0u32;
 
         loop {
             let timeout = self
@@ -150,6 +154,10 @@ impl Driver {
                 result = self.socket.recv(&mut self.recv_buf), if has_room => {
                     let n = result.map_err(|error| DriverError::socket("receive datagram", error))?;
                     let now = self.clock.now();
+                    if self.conn.is_established() && rx_logged < 8 {
+                        rx_logged += 1;
+                        tracing::debug!(len = n, head = %hex_head(&self.recv_buf[..n]), "udp rx datagram");
+                    }
 
                     // handle_datagram takes &mut [u8] for in-place prefix byte swap
                     match self.conn.handle_datagram(&mut self.recv_buf[..n], now) {
@@ -213,6 +221,11 @@ impl Driver {
                     self.drain_transmits().await?;
                     self.drain_events();
                 }
+                _ = stats_tick.tick() => {
+                    if let Some(stats) = self.conn.v1_stats() {
+                        tracing::debug!(?stats, "udp v1 tunnel");
+                    }
+                }
             }
 
             // A write that hit backpressure earlier may have room now: an
@@ -257,6 +270,10 @@ impl Driver {
             } else {
                 pad_handshake_datagram(transmit.contents)
             };
+            if self.conn.is_established() && self.tx_logged < 8 {
+                self.tx_logged += 1;
+                tracing::debug!(len = bytes.len(), head = %hex_head(&bytes), "udp tx datagram");
+            }
 
             self.socket
                 .send(&bytes)
@@ -937,4 +954,13 @@ mod tests {
         driver_handle.abort();
         drop(unresponsive_peer);
     }
+}
+
+fn hex_head(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(48)
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }

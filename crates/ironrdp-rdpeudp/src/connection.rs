@@ -133,6 +133,14 @@ pub struct ConnectionConfig {
     /// The server holds the same value and compares it against the client's
     /// SYN, which is the check 3.1.5.1.1 asks of it.
     pub cookie_hash: Option<[u8; 32]>,
+
+    /// The protocol version the client SYN offers (MS-RDPEUDP 2.2.2.9).
+    ///
+    /// Version 3 selects MS-RDPEUDP2 and requires `cookie_hash`. Offering
+    /// version 2 or 1 asks for the MS-RDPEUDP framing outright, which is what
+    /// a server that only speaks those versions answers; the SYN then carries
+    /// no cookie hash, as the specification requires.
+    pub offer_version: UdpVersion,
 }
 
 impl Default for ConnectionConfig {
@@ -145,6 +153,7 @@ impl Default for ConnectionConfig {
             idle_timeout: Duration::from_secs(65),
             keep_alive_interval: Duration::from_secs(8),
             cookie_hash: None,
+            offer_version: UdpVersion::V3,
         }
     }
 }
@@ -402,6 +411,38 @@ pub struct RdpeudpConnection {
     v1_last_cn_reaction: Option<MonotonicInstant>,
     /// The pending acknowledgement is being sent because the delayed-ACK timer fired (MS-RDPEUDP 3.1.6.3).
     v1_ack_delayed: bool,
+    /// Diagnostics: retransmitted Source Packets, ACKs sent, datagrams and Source Packets received.
+    v1_stats: V1Counters,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct V1Counters {
+    retransmits: u64,
+    acks_sent: u64,
+    datagrams_in: u64,
+    data_in: u64,
+    data_out: u64,
+}
+
+/// A snapshot of the MS-RDPEUDP version 1/2 data path, for diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct V1Stats {
+    pub version: u16,
+    pub send_pending: usize,
+    pub bytes_in_flight: u64,
+    pub send_next_source: u64,
+    pub send_lowest_pending: Option<u64>,
+    pub retransmits: u64,
+    pub data_out: u64,
+    pub acks_sent: u64,
+    pub datagrams_in: u64,
+    pub data_in: u64,
+    pub recv_base: u64,
+    pub recv_highest: u64,
+    pub recv_reorder: usize,
+    pub recv_has_gaps: bool,
+    pub srtt_ms: Option<u64>,
+    pub rto_ms: u64,
 }
 
 impl RdpeudpConnection {
@@ -425,7 +466,7 @@ impl RdpeudpConnection {
             ));
         }
 
-        if config.cookie_hash.is_none() {
+        if config.cookie_hash.is_none() && config.offer_version == UdpVersion::V3 {
             return Err(RdpeudpError::invalid_state(
                 "connect without ConnectionConfig::cookie_hash, which a version 3 SYN must carry",
             ));
@@ -558,6 +599,7 @@ impl RdpeudpConnection {
             v1_cwr_pending: false,
             v1_last_cn_reaction: None,
             v1_ack_delayed: false,
+            v1_stats: V1Counters::default(),
         }
     }
 
@@ -885,6 +927,34 @@ impl RdpeudpConnection {
         self.params.as_ref().map(|p| p.mtu)
     }
 
+    /// Diagnostics for the MS-RDPEUDP version 1/2 data path; `None` on MS-RDPEUDP2.
+    pub fn v1_stats(&self) -> Option<V1Stats> {
+        let params = self.params.as_ref()?;
+        let WireFormat::V1 { version } = params.wire else {
+            return None;
+        };
+        let send_window = self.send_window.as_ref()?;
+        let recv_window = self.recv_window.as_ref()?;
+        Some(V1Stats {
+            version,
+            send_pending: send_window.pending_entries().count(),
+            bytes_in_flight: send_window.bytes_in_flight(),
+            send_next_source: send_window.next_channel_seq(),
+            send_lowest_pending: send_window.pending_entries().map(|e| e.channel_seq).min(),
+            retransmits: self.v1_stats.retransmits,
+            data_out: self.v1_stats.data_out,
+            acks_sent: self.v1_stats.acks_sent,
+            datagrams_in: self.v1_stats.datagrams_in,
+            data_in: self.v1_stats.data_in,
+            recv_base: recv_window.base_seq(),
+            recv_highest: recv_window.highest_seq(),
+            recv_reorder: recv_window.reorder_buf_len(),
+            recv_has_gaps: recv_window.has_gaps(),
+            srtt_ms: self.rtt.srtt().map(|d| d.as_millis() as u64),
+            rto_ms: self.effective_rto().as_millis() as u64,
+        })
+    }
+
     /// The ACK delay timeout to use right now.
     ///
     /// [MS-RDPEUDP2] 3.1.5.2 gives the receiver's assumed default as "half
@@ -948,10 +1018,14 @@ impl RdpeudpConnection {
                 // (1.3.2.2). Version 2 is the same v1 data transfer with
                 // shorter timers, so advertising it and then speaking v2
                 // framing leaves the peer unable to parse anything.
-                udp_ver: UdpVersion::V3,
+                udp_ver: self.config.offer_version,
                 // 2.2.2.9: mandatory with version 3 in a client SYN.
                 // `connect` refuses to build a connection without it.
-                cookie_hash: self.config.cookie_hash,
+                cookie_hash: if self.config.offer_version == UdpVersion::V3 {
+                    self.config.cookie_hash
+                } else {
+                    None
+                },
             }),
             data: None,
         };
@@ -1640,6 +1714,7 @@ impl RdpeudpConnection {
         }
 
         let entry = self.reliability.dequeue()?;
+        self.v1_stats.retransmits += 1;
 
         // Create a new DataSeqNum for the retransmit but preserve ChannelSeqNum
         let new_data_seq = send_window.push_retransmit(entry.channel_seq, entry.data.clone(), now)?;
@@ -2005,6 +2080,7 @@ impl RdpeudpConnection {
     /// Handles an established-state datagram in `RDPUDP_FEC_HEADER` framing.
     fn handle_v1_datagram(&mut self, wire: &[u8], now: MonotonicInstant) -> Result<(), RdpeudpError> {
         let datagram: V1Datagram = decode(wire).map_err(RdpeudpError::decode)?;
+        self.v1_stats.datagrams_in += 1;
 
         // A late handshake retransmit; the peer is already answered elsewhere.
         if datagram.header.flags.contains(V1Flags::SYN) {
@@ -2052,7 +2128,9 @@ impl RdpeudpConnection {
         if let Some(vector) = ack_vector {
             let mut current = Some(highest_seen);
             for element in &vector.elements {
-                for _ in 0..element.length {
+                // Windows encodes a run of n datagrams as n - 1 (an element of 0x00
+                // acknowledges exactly one), which 2.2.2.7.1's prose leaves open.
+                for _ in 0..=element.length {
                     let Some(source_seq) = current else {
                         break;
                     };
@@ -2134,6 +2212,7 @@ impl RdpeudpConnection {
         if !recv_window.receive(source_seq, source_seq, data.payload) {
             return;
         }
+        self.v1_stats.data_in += 1;
 
         for chunk in recv_window.drain_ordered() {
             self.pending_events.push_back(Event::DataReceived(chunk));
@@ -2160,15 +2239,16 @@ impl RdpeudpConnection {
                 if elements.len() >= V1_ACK_VECTOR_MAX_ELEMENTS {
                     break 'runs;
                 }
-                let chunk = u8::try_from(remaining.min(u64::from(V1AckVectorElement::MAX_LENGTH)))
-                    .expect("clamped to 6-bit range");
+                let chunk = u8::try_from(remaining.min(u64::from(V1AckVectorElement::MAX_LENGTH) + 1))
+                    .expect("clamped to 6-bit range plus one");
                 elements.push(V1AckVectorElement {
                     state: if received {
                         VectorElementState::DatagramReceived
                     } else {
                         VectorElementState::DatagramNotYetReceived
                     },
-                    length: chunk,
+                    // Wire length is count - 1; see process_v1_acknowledgement.
+                    length: chunk - 1,
                 });
                 remaining -= u64::from(chunk);
             }
@@ -2177,7 +2257,7 @@ impl RdpeudpConnection {
             // Nothing since the handshake: acknowledge the SYN+ACK's own sequence number.
             elements.push(V1AckVectorElement {
                 state: VectorElementState::DatagramReceived,
-                length: 1,
+                length: 0,
             });
         }
 
@@ -2216,6 +2296,7 @@ impl RdpeudpConnection {
     }
 
     fn finish_v1_acknowledgement(&mut self) {
+        self.v1_stats.acks_sent += 1;
         self.commit_acknowledgement();
         self.ack_pending = false;
         self.timers.clear(Timer::AckDelay);
@@ -2253,6 +2334,7 @@ impl RdpeudpConnection {
 
         let contents = encode_vec(&datagram).ok()?;
         self.v1_cwr_pending = false;
+        self.v1_stats.data_out += 1;
         self.finish_v1_acknowledgement();
         Some(Transmit { contents })
     }
@@ -2556,7 +2638,7 @@ mod v1_tests {
                         } else {
                             VectorElementState::DatagramNotYetReceived
                         },
-                        length: *n,
+                        length: n - 1, // wire runs are count - 1
                     })
                     .collect(),
             }),
@@ -2689,7 +2771,7 @@ mod v1_tests {
         let elements = datagram.ack_vector.unwrap().elements;
         assert_eq!(elements.len(), 1);
         assert!(elements[0].state.is_received());
-        assert_eq!(elements[0].length, 2);
+        assert_eq!(elements[0].length, 1, "two datagrams, encoded as count - 1");
     }
 
     #[test]
@@ -2704,9 +2786,9 @@ mod v1_tests {
         let elements = datagram.ack_vector.unwrap().elements;
         // Highest first: +3 received, then +2 and +1 missing.
         assert!(elements[0].state.is_received());
-        assert_eq!(elements[0].length, 1);
+        assert_eq!(elements[0].length, 0, "one datagram");
         assert!(!elements[1].state.is_received());
-        assert_eq!(elements[1].length, 2);
+        assert_eq!(elements[1].length, 1, "two datagrams");
     }
 
     #[test]

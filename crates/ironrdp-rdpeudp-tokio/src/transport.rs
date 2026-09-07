@@ -415,6 +415,18 @@ pub async fn connect_udp(config: UdpTransportConfig) -> Result<UdpTransport, Udp
 
     let mut connection_config = config.connection_config;
     connection_config.cookie_hash = Some(cookie_hash(&config.tunnel_config));
+    // Evaluation switch: IRONRDP_UDP_OFFER=1|2 asks for the MS-RDPEUDP framing
+    // directly instead of the version 3 (MS-RDPEUDP2) default.
+    if let Some(offer) = std::env::var("IRONRDP_UDP_OFFER")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+    {
+        connection_config.offer_version = match offer {
+            1 => ironrdp_rdpeudp::pdu::UdpVersion::V1,
+            2 => ironrdp_rdpeudp::pdu::UdpVersion::V2,
+            _ => ironrdp_rdpeudp::pdu::UdpVersion::V3,
+        };
+    }
 
     let conn = RdpeudpConnection::connect(connection_config, Clock::new().now()).map_err(|error| {
         UdpTransportError::handshake("connect UDP", DriverError::rdpeudp("build RDP-UDP connection", error))
