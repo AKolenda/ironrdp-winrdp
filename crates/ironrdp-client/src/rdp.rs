@@ -3157,6 +3157,16 @@ async fn active_session(
                         // Therefore, we can remove unnecessary casts from u16 to u32 and back.
                         let (width, height) = MonitorLayoutEntry::adjust_display_size(width, height);
                         debug!(width, height, "Adjusted display size");
+                        // A layout equal to the current desktop is a no-op for the server: it
+                        // never deactivates, so waiting for a reactivation only stalls every
+                        // later resize behind it and ends in a needless reconnect.
+                        let already_that_size = resize_queue.in_flight.is_none()
+                            && u16::try_from(width).is_ok_and(|w| w == image.width())
+                            && u16::try_from(height).is_ok_and(|h| h == image.height());
+                        if already_that_size {
+                            debug!(width, height, "Display already at the requested size; nothing to resize");
+                            continue;
+                        }
                         let request = ResizeRequest {
                             width: u16::try_from(width).expect("always in the range"),
                             height: u16::try_from(height).expect("always in the range"),

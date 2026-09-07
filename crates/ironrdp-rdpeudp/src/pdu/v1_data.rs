@@ -1,6 +1,7 @@
 //! MS-RDPEUDP 2.2.2.4 `RDPUDP_SOURCE_PAYLOAD_HEADER` and the data payload that
 //! follows it in a version 1/2 Source Packet.
 
+#[allow(unused_imports)] // the std prelude also provides Vec when the std feature is on
 use alloc::vec::Vec;
 
 use ironrdp_core::{Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor};
