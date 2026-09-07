@@ -119,10 +119,12 @@ pub(crate) async fn tunnel_data_loop<S>(
     stream: &mut S,
     tunnel: &mut RdpemtTunnel,
     data_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    outgoing: &tokio::sync::mpsc::Sender<Outgoing>,
 ) -> Result<(), UdpTransportError>
 where
     S: AsyncRead + Unpin,
 {
+    let mut responder = AutoDetectResponder::default();
     loop {
         let pdu = match read_tunnel_pdu(stream).await {
             Ok(Some(pdu)) => pdu,
@@ -141,7 +143,15 @@ where
                 // 2.2.14) are not consumed here; this driver only wires the DVC
                 // payload through. A future auto-detect integration would need to
                 // dispatch them instead of discarding them.
-                TunnelEvent::Data { data, .. } => {
+                TunnelEvent::Data { data, sub_headers } => {
+                    // MS-RDPEMT 2.2.1.1.1: sub-headers carry the server's auto-detect
+                    // probes for this transport (MS-RDPBCGR 2.2.14). Windows will not
+                    // route channel traffic over a sideband whose probes go unanswered.
+                    for response in responder.handle(&sub_headers) {
+                        if outgoing.send(Outgoing::Encoded(response)).await.is_err() {
+                            return Ok(());
+                        }
+                    }
                     if data_tx.send(data).await.is_err() {
                         // Application dropped the receiver
                         return Ok(());
@@ -242,5 +252,113 @@ mod tests {
         // Complete header (PayloadLen=5) but only 2 payload bytes arrive.
         let mut cursor = io::Cursor::new(vec![0x02, 0x05, 0x00, 0x04, 0x48, 0x65]);
         assert!(read_tunnel_pdu(&mut cursor).await.is_err());
+    }
+}
+
+/// What the write pump puts on the tunnel: higher-layer data to wrap in a
+/// `TunnelData` PDU, or a PDU that is already encoded (sub-header replies).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Outgoing {
+    Data(Vec<u8>),
+    Encoded(Vec<u8>),
+}
+
+/// Answers the auto-detect requests the server sends in tunnel sub-headers
+/// (MS-RDPBCGR 2.2.14): RTT probes get an RTT response, and a bandwidth
+/// measurement is timed and byte-counted from Start to Stop.
+#[derive(Default)]
+struct AutoDetectResponder {
+    bandwidth_started_at: Option<std::time::Instant>,
+    bandwidth_bytes: u64,
+}
+
+impl AutoDetectResponder {
+    fn handle(&mut self, sub_headers: &[ironrdp_rdpemt::TunnelSubHeader]) -> Vec<Vec<u8>> {
+        use ironrdp_pdu::rdp::autodetect::{
+            AutoDetectRequest, AutoDetectResponse, BW_RESULTS_CONNECT_TIME, BW_RESULTS_CONTINUOUS, BW_STOP_CONNECT_TIME,
+        };
+        use ironrdp_rdpemt::{SubHeaderType, TunnelData, TunnelSubHeader};
+
+        let mut responses = Vec::new();
+        for sub_header in sub_headers {
+            if sub_header.sub_header_type != SubHeaderType::AutoDetectRequest {
+                continue;
+            }
+            let request: AutoDetectRequest = match ironrdp_core::decode(&sub_header.data) {
+                Ok(request) => request,
+                Err(error) => {
+                    tracing::debug!(%error, "ignoring an undecodable auto-detect request on the UDP tunnel");
+                    continue;
+                }
+            };
+            let response = match request {
+                AutoDetectRequest::RttRequest { sequence_number, .. } => {
+                    Some(AutoDetectResponse::RttResponse { sequence_number })
+                }
+                AutoDetectRequest::BandwidthMeasureStart { .. } => {
+                    self.bandwidth_started_at = Some(std::time::Instant::now());
+                    self.bandwidth_bytes = 0;
+                    None
+                }
+                AutoDetectRequest::BandwidthMeasurePayload { payload, .. } => {
+                    self.bandwidth_bytes += payload.len() as u64;
+                    None
+                }
+                AutoDetectRequest::BandwidthMeasureStop {
+                    sequence_number,
+                    request_type,
+                    payload,
+                } => {
+                    self.bandwidth_bytes += payload.map_or(0, |p| p.len() as u64);
+                    let elapsed = self
+                        .bandwidth_started_at
+                        .take()
+                        .map_or(0, |started| started.elapsed().as_millis() as u32);
+                    let response_type = if request_type == BW_STOP_CONNECT_TIME {
+                        BW_RESULTS_CONNECT_TIME
+                    } else {
+                        BW_RESULTS_CONTINUOUS
+                    };
+                    Some(AutoDetectResponse::BandwidthMeasureResults {
+                        sequence_number,
+                        response_type,
+                        time_delta_ms: elapsed,
+                        byte_count: u32::try_from(self.bandwidth_bytes).unwrap_or(u32::MAX),
+                    })
+                }
+                AutoDetectRequest::NetworkCharacteristicsResult {
+                    base_rtt_ms,
+                    bandwidth_kbps,
+                    average_rtt_ms,
+                    ..
+                } => {
+                    tracing::debug!(?base_rtt_ms, ?bandwidth_kbps, average_rtt_ms, "UDP tunnel network characteristics");
+                    None
+                }
+            };
+            let Some(response) = response else {
+                continue;
+            };
+            tracing::debug!(?response, "answering auto-detect request on the UDP tunnel");
+            let data = match ironrdp_core::encode_vec(&response) {
+                Ok(data) => data,
+                Err(error) => {
+                    tracing::debug!(%error, "could not encode an auto-detect response");
+                    continue;
+                }
+            };
+            let pdu = TunnelData {
+                sub_headers: vec![TunnelSubHeader {
+                    sub_header_type: SubHeaderType::AutoDetectResponse,
+                    data,
+                }],
+                higher_layer_data: Vec::new(),
+            };
+            match ironrdp_core::encode_vec(&pdu) {
+                Ok(encoded) => responses.push(encoded),
+                Err(error) => tracing::debug!(%error, "could not encode a tunnel sub-header reply"),
+            }
+        }
+        responses
     }
 }
