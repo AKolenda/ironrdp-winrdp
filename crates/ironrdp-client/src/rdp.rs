@@ -567,7 +567,7 @@ struct TimedResizeRequest {
     deadline: tokio::time::Instant,
 }
 
-const DISPLAY_CONTROL_READY_TIMEOUT: Duration = Duration::from_secs(3);
+const DISPLAY_CONTROL_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
 struct ResizeQueue {
