@@ -324,6 +324,9 @@ impl ViewerConfig {
         // The library overlays everything expressible as a `.rdp` property: destination, credentials,
         // transport, channels, desktop size, audio, DVC proxies, etc.
         let builder = ConfigBuilder::from_property_set(&properties)?;
+        // Local evaluation switch: nothing in the viewer or the `.rdp` schema enables reliable
+        // RDP-UDP2 yet, so expose the library opt-in through IRONRDP_UDP=1 for A/B testing.
+        let builder = builder.with_udp_transport(std::env::var_os("IRONRDP_UDP").is_some_and(|v| v == "1"));
 
         // Whether the `.rdp` file requested clipboard redirection; the CLI `--clipboard-type` is
         // resolved against this when applied below.
