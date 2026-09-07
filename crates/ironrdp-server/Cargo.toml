@@ -34,7 +34,7 @@ nscodec = ["dep:ironrdp-nscodec"]
 __bench = ["dep:visibility"]
 
 [dependencies]
-rand = "0.9"
+rand = "0.10"
 tokio = { version = "1", features = ["net", "macros", "sync", "rt", "time"] }
 tokio-rustls = "0.26" # public
 async-trait = "0.1"
