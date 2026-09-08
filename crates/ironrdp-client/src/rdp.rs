@@ -2790,9 +2790,105 @@ enum RdpControlFlow {
     TerminatedGracefully(GracefulDisconnectReason),
 }
 
+/// Per-second session performance counters, logged at INFO as `session perf` so
+/// transports (TCP vs reliable UDP) can be compared from the log alone.
+struct PerfCounters {
+    started: Instant,
+    last_report: Instant,
+    tcp_bytes: u64,
+    udp_bytes: u64,
+    tcp_bytes_total: u64,
+    udp_bytes_total: u64,
+    /// Time spent decoding/processing inbound PDUs since the last report.
+    busy: Duration,
+    busy_total: Duration,
+    last_frames: u32,
+    first_frames: Option<u32>,
+}
+
+impl PerfCounters {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            last_report: now,
+            tcp_bytes: 0,
+            udp_bytes: 0,
+            tcp_bytes_total: 0,
+            udp_bytes_total: 0,
+            busy: Duration::ZERO,
+            busy_total: Duration::ZERO,
+            last_frames: 0,
+            first_frames: None,
+        }
+    }
+
+    fn report_if_due(&mut self, active_stage: &ActiveStage) {
+        let elapsed = self.last_report.elapsed();
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+        let frames_decoded = active_stage
+            .get_dvc::<GraphicsPipelineClient>()
+            .map(|gfx| gfx.processor().total_frames_decoded())
+            .unwrap_or(0);
+        let first = *self.first_frames.get_or_insert(frames_decoded);
+        let frames = frames_decoded.wrapping_sub(self.last_frames);
+        self.last_frames = frames_decoded;
+        let secs = elapsed.as_secs_f64();
+        let bytes = self.tcp_bytes + self.udp_bytes;
+        let transport = if active_stage.reliable_udp_dvc_tunnel_in_use() {
+            "udp"
+        } else {
+            "tcp"
+        };
+        let uptime = self.started.elapsed().as_secs_f64();
+        info!(
+            transport,
+            fps = format_args!("{:.1}", f64::from(frames) / secs),
+            kbps = format_args!("{:.0}", bytes as f64 * 8.0 / 1000.0 / secs),
+            busy_pct = format_args!("{:.1}", self.busy.as_secs_f64() * 100.0 / secs),
+            tcp_bytes = self.tcp_bytes,
+            udp_bytes = self.udp_bytes,
+            frames_total = frames_decoded.wrapping_sub(first),
+            avg_fps = format_args!(
+                "{:.1}",
+                f64::from(frames_decoded.wrapping_sub(first)) / uptime.max(1e-3)
+            ),
+            mb_total = format_args!("{:.2}", (self.tcp_bytes_total + self.udp_bytes_total) as f64 / 1e6),
+            busy_total_ms = self.busy_total.as_millis(),
+            uptime_s = format_args!("{uptime:.0}"),
+            "session perf"
+        );
+        self.tcp_bytes = 0;
+        self.udp_bytes = 0;
+        self.busy = Duration::ZERO;
+        self.last_report = Instant::now();
+    }
+
+    fn account_tcp(&mut self, len: usize, busy: Duration) {
+        self.tcp_bytes += len as u64;
+        self.tcp_bytes_total += len as u64;
+        self.busy += busy;
+        self.busy_total += busy;
+    }
+
+    fn account_udp(&mut self, len: usize, busy: Duration) {
+        self.udp_bytes += len as u64;
+        self.udp_bytes_total += len as u64;
+        self.busy += busy;
+        self.busy_total += busy;
+    }
+}
+
 struct ActiveSessionIteration {
     outputs: Vec<ActiveStageOutput>,
     dvc_batch: Option<DvcMessageBatch>,
+    /// Tunnel the DVC batch is a reply on. MS-RDPEDYC requires responses to go back on
+    /// the transport the request arrived on, which matters for a Create Request received
+    /// on the tunnel and declined (the channel is never bound, so the Soft-Sync routing
+    /// table cannot answer where its NO_LISTENER response belongs).
+    reply_tunnel: Option<SoftSyncTunnelType>,
 }
 
 impl ActiveSessionIteration {
@@ -2800,6 +2896,7 @@ impl ActiveSessionIteration {
         Self {
             outputs,
             dvc_batch: None,
+            reply_tunnel: None,
         }
     }
 
@@ -2807,6 +2904,7 @@ impl ActiveSessionIteration {
         Self {
             outputs: Vec::new(),
             dvc_batch: Some(dvc_batch),
+            reply_tunnel: None,
         }
     }
 
@@ -2814,6 +2912,15 @@ impl ActiveSessionIteration {
         Self {
             outputs,
             dvc_batch: Some(dvc_batch),
+            reply_tunnel: None,
+        }
+    }
+
+    fn from_tunnel(tunnel: SoftSyncTunnelType, dvc_batch: DvcMessageBatch, outputs: Vec<ActiveStageOutput>) -> Self {
+        Self {
+            outputs,
+            dvc_batch: Some(dvc_batch),
+            reply_tunnel: Some(tunnel),
         }
     }
 }
@@ -2945,6 +3052,7 @@ async fn active_session(
     let mut graceful_shutdown_sent = false;
     let mut post_logon_redraw_requested = false;
     let mut pending_udp_payload: Option<Vec<u8>> = None;
+    let mut perf = PerfCounters::new();
     let mut initial_outputs = if *graceful_close_receiver.borrow_and_update() {
         graceful_shutdown_sent = true;
         Some(active_stage.graceful_shutdown()?)
@@ -2982,9 +3090,17 @@ async fn active_session(
         };
         let buffered_udp_iteration = if initial_outputs.is_none() && active_stage.reliable_udp_dvc_tunnel_in_use() {
             match pending_udp_payload.take() {
-                Some(payload) => Some(ActiveSessionIteration::dvc(
-                    active_stage.process_dvc_tunnel(SoftSyncTunnelType::RELIABLE_UDP, &payload)?,
-                )),
+                Some(payload) => {
+                    let processing_started = Instant::now();
+                    let (batch, outputs) =
+                        active_stage.process_dvc_tunnel(SoftSyncTunnelType::RELIABLE_UDP, &payload, &mut image)?;
+                    perf.account_udp(payload.len(), processing_started.elapsed());
+                    Some(ActiveSessionIteration::from_tunnel(
+                        SoftSyncTunnelType::RELIABLE_UDP,
+                        batch,
+                        outputs,
+                    ))
+                }
                 None => None,
             }
         } else {
@@ -3025,7 +3141,9 @@ async fn active_session(
                         Err(error) => return Err(ironrdp_session::custom_err!("read frame", error)),
                     };
                     trace!(?action, frame_length = payload.len(), "Frame received");
+                    let processing_started = Instant::now();
                     let mut outputs = active_stage.process(&mut image, action, &payload)?;
+                    perf.account_tcp(payload.len(), processing_started.elapsed());
                     #[cfg(feature = "rdpdr")]
                     if let Some(output) = poll_deferred_rdpdr_output(&mut active_stage)? {
                         outputs.push(output);
@@ -3123,9 +3241,14 @@ async fn active_session(
                     }
                     Some(payload) => {
                         if active_stage.reliable_udp_dvc_tunnel_in_use() {
-                            let batch =
-                                active_stage.process_dvc_tunnel(SoftSyncTunnelType::RELIABLE_UDP, &payload)?;
-                            ActiveSessionIteration::dvc(batch)
+                            let processing_started = Instant::now();
+                            let (batch, outputs) = active_stage.process_dvc_tunnel(
+                                SoftSyncTunnelType::RELIABLE_UDP,
+                                &payload,
+                                &mut image,
+                            )?;
+                            perf.account_udp(payload.len(), processing_started.elapsed());
+                            ActiveSessionIteration::from_tunnel(SoftSyncTunnelType::RELIABLE_UDP, batch, outputs)
                         } else {
                             // The server can send on UDP immediately after its Soft-Sync request,
                             // before the independently ordered request arrives over TCP. Stop
@@ -3551,12 +3674,14 @@ async fn active_session(
             }
         };
 
+        perf.report_if_due(&active_stage);
+
         if let Some(batch) = iteration.dvc_batch {
             let channel_id = batch.channel_id();
             let messages = batch.into_messages();
             #[cfg(feature = "udp")]
-            let route_over_udp =
-                active_stage.dvc_tunnel_for_channel(channel_id) == Some(SoftSyncTunnelType::RELIABLE_UDP);
+            let route_over_udp = iteration.reply_tunnel == Some(SoftSyncTunnelType::RELIABLE_UDP)
+                || active_stage.dvc_tunnel_for_channel(channel_id) == Some(SoftSyncTunnelType::RELIABLE_UDP);
             #[cfg(not(feature = "udp"))]
             let route_over_udp = {
                 let _ = channel_id;

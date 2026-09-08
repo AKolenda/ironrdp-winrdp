@@ -220,16 +220,11 @@ impl ActiveStage {
 
                 // Drain the client-side EGFX compositor: composite each completed-frame
                 // output region into the image and surface it as a graphics update. EGFX
-                // data only ever arrives over a DVC, which is X224-carried, so this stays
-                // out of the Action::FastPath arm rather than running on every fast-path
-                // frame (the highest-frequency path in a session).
-                let graphics_updates = self
-                    .get_dvc_mut::<GraphicsPipelineClient>()
-                    .map(|mut gfx| gfx.processor_mut().drain_output())
-                    .unwrap_or_default();
-                if let Some(region) =
-                    composite_graphics_updates(image, graphics_updates.into_iter().map(|u| (u.region, u.data)))?
-                {
+                // data only ever arrives over a DVC, which is X224-carried (or a Soft-Sync
+                // tunnel, see `process_dvc_tunnel`), so this stays out of the
+                // Action::FastPath arm rather than running on every fast-path frame (the
+                // highest-frequency path in a session).
+                if let Some(region) = self.drain_graphics_pipeline(image)? {
                     stage_outputs.push(ActiveStageOutput::GraphicsUpdate(region));
                 }
 
@@ -523,15 +518,38 @@ impl ActiveStage {
     ///
     /// Response messages remain unframed so the caller can encode them with
     /// [`SvcMessage::encode_unframed_pdu`] and send them through the selected tunnel.
+    ///
+    /// The graphics pipeline is the channel Windows moves to the tunnel, so completed
+    /// EGFX frames are composited into `image` here exactly as [`Self::process`] does for
+    /// TCP-carried DVC data; the resulting graphics updates are returned alongside the
+    /// batch so the caller can repaint.
     pub fn process_dvc_tunnel(
         &mut self,
         tunnel_type: SoftSyncTunnelType,
         payload: &[u8],
-    ) -> SessionResult<DvcMessageBatch> {
-        self.get_svc_processor_mut::<DrdynvcClient>()
+        image: &mut DecodedImage,
+    ) -> SessionResult<(DvcMessageBatch, Vec<ActiveStageOutput>)> {
+        let batch = self
+            .get_svc_processor_mut::<DrdynvcClient>()
             .ok_or_else(|| SessionError::general("DRDYNVC static channel is not available"))?
             .process_tunnel(tunnel_type, payload)
-            .map_err(SessionError::pdu)
+            .map_err(SessionError::pdu)?;
+        let mut outputs = Vec::new();
+        if let Some(region) = self.drain_graphics_pipeline(image)? {
+            outputs.push(ActiveStageOutput::GraphicsUpdate(region));
+        }
+        Ok((batch, outputs))
+    }
+
+    /// Composites every completed EGFX frame region into `image`.
+    ///
+    /// Returns the union of the changed regions, or `None` when nothing was pending.
+    fn drain_graphics_pipeline(&mut self, image: &mut DecodedImage) -> SessionResult<Option<InclusiveRectangle>> {
+        let graphics_updates = self
+            .get_dvc_mut::<GraphicsPipelineClient>()
+            .map(|mut gfx| gfx.processor_mut().drain_output())
+            .unwrap_or_default();
+        composite_graphics_updates(image, graphics_updates.into_iter().map(|u| (u.region, u.data)))
     }
 
     /// Prepares a resize request for routing over TCP or a Soft-Sync tunnel.
@@ -1439,16 +1457,18 @@ mod tests {
             rdpei_ready,
         ))))
         .unwrap();
+        let mut image = DecodedImage::new(PixelFormat::RgbA32, 4, 4);
         assert!(
             stage
-                .process_dvc_tunnel(SoftSyncTunnelType::LOSSY_UDP, &tunnel_data)
+                .process_dvc_tunnel(SoftSyncTunnelType::LOSSY_UDP, &tunnel_data, &mut image)
                 .is_err()
         );
 
-        let response = stage
-            .process_dvc_tunnel(SoftSyncTunnelType::RELIABLE_UDP, &tunnel_data)
+        let (response, outputs) = stage
+            .process_dvc_tunnel(SoftSyncTunnelType::RELIABLE_UDP, &tunnel_data, &mut image)
             .unwrap();
         assert_prepared_batch(&response, 2);
+        assert!(outputs.is_empty());
     }
 
     fn active_stage_with_ready_dvcs() -> ActiveStage {

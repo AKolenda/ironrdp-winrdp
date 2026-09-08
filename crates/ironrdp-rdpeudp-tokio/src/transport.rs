@@ -333,7 +333,10 @@ impl UdpTransport {
     /// For unit tests that exercise the channel-based API (FramedRead,
     /// FramedWrite) without needing a real UDP socket or TLS stack.
     #[cfg(test)]
-    pub(crate) fn from_channels(data_rx: mpsc::Receiver<Vec<u8>>, data_tx: mpsc::Sender<crate::tunnel::Outgoing>) -> Self {
+    pub(crate) fn from_channels(
+        data_rx: mpsc::Receiver<Vec<u8>>,
+        data_tx: mpsc::Sender<crate::tunnel::Outgoing>,
+    ) -> Self {
         Self {
             data_rx,
             data_tx,
@@ -765,8 +768,9 @@ where
                     sub_headers: Vec::new(),
                     higher_layer_data: data,
                 };
-                ironrdp_core::encode_vec(&pdu)
-                    .map_err(|error| UdpTransportError::rdpemt("write pump", ironrdp_rdpemt::RdpemtError::encode(error)))?
+                ironrdp_core::encode_vec(&pdu).map_err(|error| {
+                    UdpTransportError::rdpemt("write pump", ironrdp_rdpemt::RdpemtError::encode(error))
+                })?
             }
             crate::tunnel::Outgoing::Encoded(pdu) => pdu,
         };
