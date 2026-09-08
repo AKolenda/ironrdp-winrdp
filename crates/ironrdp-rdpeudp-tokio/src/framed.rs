@@ -72,7 +72,11 @@ mod tests {
     use super::*;
 
     /// Build a `UdpTransport` backed by test channels (no real network).
-    fn test_transport() -> (UdpTransport, mpsc::Sender<Vec<u8>>, mpsc::Receiver<crate::tunnel::Outgoing>) {
+    fn test_transport() -> (
+        UdpTransport,
+        mpsc::Sender<Vec<u8>>,
+        mpsc::Receiver<crate::tunnel::Outgoing>,
+    ) {
         let (incoming_tx, incoming_rx) = mpsc::channel::<Vec<u8>>(16);
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<crate::tunnel::Outgoing>(16);
 

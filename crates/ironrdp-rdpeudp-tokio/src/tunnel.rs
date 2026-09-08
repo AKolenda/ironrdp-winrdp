@@ -147,7 +147,7 @@ where
                     // MS-RDPEMT 2.2.1.1.1: sub-headers carry the server's auto-detect
                     // probes for this transport (MS-RDPBCGR 2.2.14). Windows will not
                     // route channel traffic over a sideband whose probes go unanswered.
-                    for response in responder.handle(&sub_headers) {
+                    for response in responder.handle(&sub_headers, pdu.len()) {
                         if outgoing.send(Outgoing::Encoded(response)).await.is_err() {
                             return Ok(());
                         }
@@ -175,6 +175,62 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Windows frames the RTT Measure Request as `06 00 <seq> 01 00`: the sub-header
+    /// prefix doubles as the auto-detect header. The reply must be framed the same way,
+    /// `06 01 <seq> 00 00`, with no duplicated header inside the sub-header data.
+    #[test]
+    fn auto_detect_responder_answers_an_rtt_request_framed_as_a_sub_header() {
+        use ironrdp_rdpemt::{SubHeaderType, TunnelSubHeader};
+
+        let mut responder = AutoDetectResponder::default();
+        let sub_header = TunnelSubHeader {
+            sub_header_type: SubHeaderType::AutoDetectRequest,
+            // sequenceNumber = 0x0007, requestType = RTT_REQUEST_CONTINUOUS (0x0001)
+            data: vec![0x07, 0x00, 0x01, 0x00],
+        };
+        let responses = responder.handle(&[sub_header], 10);
+        assert_eq!(responses.len(), 1);
+        // TunnelData: action=2, payloadLength=0, headerLength=4+6, then the sub-header.
+        assert_eq!(
+            responses[0],
+            vec![0x02, 0x00, 0x00, 0x0A, 0x06, 0x01, 0x07, 0x00, 0x00, 0x00]
+        );
+    }
+
+    /// A bandwidth measurement (Start, Payload, Stop) is answered with one Results PDU.
+    #[test]
+    fn auto_detect_responder_measures_bandwidth_across_sub_headers() {
+        use ironrdp_rdpemt::{SubHeaderType, TunnelSubHeader};
+
+        let mut responder = AutoDetectResponder::default();
+        let start = TunnelSubHeader {
+            sub_header_type: SubHeaderType::AutoDetectRequest,
+            // seq = 1, BW_START_RELIABLE_UDP (0x0014)
+            data: vec![0x01, 0x00, 0x14, 0x00],
+        };
+        assert!(responder.handle(&[start], 10).is_empty());
+        let payload = TunnelSubHeader {
+            sub_header_type: SubHeaderType::AutoDetectRequest,
+            // seq = 2, BW_PAYLOAD (0x0002), payloadLength = 3
+            data: vec![0x02, 0x00, 0x02, 0x00, 0x03, 0x00, 0xAA, 0xBB, 0xCC],
+        };
+        assert!(responder.handle(&[payload], 15).is_empty());
+        let stop = TunnelSubHeader {
+            sub_header_type: SubHeaderType::AutoDetectRequest,
+            // seq = 3, BW_STOP_RELIABLE_UDP (0x0429)
+            data: vec![0x03, 0x00, 0x29, 0x04],
+        };
+        let responses = responder.handle(&[stop], 10);
+        assert_eq!(responses.len(), 1);
+        let pdu = &responses[0];
+        // Sub-header: length 0x0E, type AutoDetectResponse, seq 3, BW_RESULTS_CONTINUOUS (0x000B)
+        assert_eq!(&pdu[..4], &[0x02, 0x00, 0x00, 0x12]);
+        assert_eq!(&pdu[4..10], &[0x0E, 0x01, 0x03, 0x00, 0x0B, 0x00]);
+        // Start PDU (10) + Payload PDU (15) + its explicit 3-byte payload + Stop PDU (10).
+        let byte_count = u32::from_le_bytes([pdu[14], pdu[15], pdu[16], pdu[17]]);
+        assert_eq!(byte_count, 10 + 15 + 3 + 10);
+    }
 
     /// Verify that read_tunnel_pdu correctly reassembles a simple Data PDU.
     #[tokio::test]
@@ -266,6 +322,11 @@ pub(crate) enum Outgoing {
 /// Answers the auto-detect requests the server sends in tunnel sub-headers
 /// (MS-RDPBCGR 2.2.14): RTT probes get an RTT response, and a bandwidth
 /// measurement is timed and byte-counted from Start to Stop.
+///
+/// Continuous measurements on a tunnel carry no explicit payload PDUs: the
+/// server brackets ordinary channel traffic with Start and Stop and expects the
+/// client to report every byte it received in between (MS-RDPBCGR 3.2.5.14),
+/// so each tunnel PDU's full wire length is counted while a window is open.
 #[derive(Default)]
 struct AutoDetectResponder {
     bandwidth_started_at: Option<std::time::Instant>,
@@ -273,21 +334,32 @@ struct AutoDetectResponder {
 }
 
 impl AutoDetectResponder {
-    fn handle(&mut self, sub_headers: &[ironrdp_rdpemt::TunnelSubHeader]) -> Vec<Vec<u8>> {
+    fn handle(&mut self, sub_headers: &[ironrdp_rdpemt::TunnelSubHeader], pdu_len: usize) -> Vec<Vec<u8>> {
         use ironrdp_pdu::rdp::autodetect::{
-            AutoDetectRequest, AutoDetectResponse, BW_RESULTS_CONNECT_TIME, BW_RESULTS_CONTINUOUS, BW_STOP_CONNECT_TIME,
+            AutoDetectRequest, AutoDetectResponse, BW_RESULTS_CONNECT_TIME, BW_RESULTS_CONTINUOUS,
+            BW_STOP_CONNECT_TIME, TYPE_ID_AUTODETECT_REQUEST,
         };
         use ironrdp_rdpemt::{SubHeaderType, TunnelData, TunnelSubHeader};
 
         let mut responses = Vec::new();
+        if self.bandwidth_started_at.is_some() {
+            self.bandwidth_bytes += pdu_len as u64;
+        }
         for sub_header in sub_headers {
             if sub_header.sub_header_type != SubHeaderType::AutoDetectRequest {
                 continue;
             }
-            let request: AutoDetectRequest = match ironrdp_core::decode(&sub_header.data) {
+            // MS-RDPEMT 2.2.1.1.1: the sub-header *is* the auto-detect structure. Its
+            // SubHeaderLength/SubHeaderType bytes are the structure's headerLength/headerTypeId,
+            // and `TunnelSubHeader::data` holds only what follows them. Re-attach the two
+            // bytes so the MS-RDPBCGR 2.2.14.1 decoder sees the layout it expects.
+            let request: AutoDetectRequest = match ironrdp_core::decode(&with_auto_detect_header(
+                TYPE_ID_AUTODETECT_REQUEST,
+                &sub_header.data,
+            )) {
                 Ok(request) => request,
                 Err(error) => {
-                    tracing::debug!(%error, "ignoring an undecodable auto-detect request on the UDP tunnel");
+                    tracing::debug!(%error, data = ?sub_header.data, "ignoring an undecodable auto-detect request on the UDP tunnel");
                     continue;
                 }
             };
@@ -297,7 +369,8 @@ impl AutoDetectResponder {
                 }
                 AutoDetectRequest::BandwidthMeasureStart { .. } => {
                     self.bandwidth_started_at = Some(std::time::Instant::now());
-                    self.bandwidth_bytes = 0;
+                    // The PDU carrying the Start opens the window and is part of it.
+                    self.bandwidth_bytes = pdu_len as u64;
                     None
                 }
                 AutoDetectRequest::BandwidthMeasurePayload { payload, .. } => {
@@ -310,10 +383,15 @@ impl AutoDetectResponder {
                     payload,
                 } => {
                     self.bandwidth_bytes += payload.map_or(0, |p| p.len() as u64);
+                    // Floor at 1 ms: the server computes byteCount * 8 / timeDelta
+                    // (MS-RDPBCGR 3.3.5.14), and a LAN probe can complete inside a millisecond.
                     let elapsed = self
                         .bandwidth_started_at
                         .take()
-                        .map_or(0, |started| started.elapsed().as_millis() as u32);
+                        .map_or(1, |started| {
+                            u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX)
+                        })
+                        .max(1);
                     let response_type = if request_type == BW_STOP_CONNECT_TIME {
                         BW_RESULTS_CONNECT_TIME
                     } else {
@@ -332,7 +410,12 @@ impl AutoDetectResponder {
                     average_rtt_ms,
                     ..
                 } => {
-                    tracing::debug!(?base_rtt_ms, ?bandwidth_kbps, average_rtt_ms, "UDP tunnel network characteristics");
+                    tracing::debug!(
+                        ?base_rtt_ms,
+                        ?bandwidth_kbps,
+                        average_rtt_ms,
+                        "UDP tunnel network characteristics"
+                    );
                     None
                 }
             };
@@ -341,7 +424,9 @@ impl AutoDetectResponder {
             };
             tracing::debug!(?response, "answering auto-detect request on the UDP tunnel");
             let data = match ironrdp_core::encode_vec(&response) {
-                Ok(data) => data,
+                // Symmetric to the request side: the sub-header prefix written by
+                // `TunnelSubHeader::encode` replaces the response's headerLength/headerTypeId.
+                Ok(data) => strip_auto_detect_header(data),
                 Err(error) => {
                     tracing::debug!(%error, "could not encode an auto-detect response");
                     continue;
@@ -361,4 +446,25 @@ impl AutoDetectResponder {
         }
         responses
     }
+}
+
+/// Size of the shared `headerLength` + `headerTypeId` prefix (MS-RDPBCGR 2.2.14.1/2.2.14.2)
+/// that a tunnel sub-header carries as `SubHeaderLength` + `SubHeaderType`.
+const AUTO_DETECT_HEADER_PREFIX: usize = 2;
+
+/// Rebuilds a complete auto-detect structure from a sub-header's trailing bytes.
+fn with_auto_detect_header(header_type_id: u8, data: &[u8]) -> Vec<u8> {
+    let header_length = u8::try_from(data.len() + AUTO_DETECT_HEADER_PREFIX).unwrap_or(u8::MAX);
+    let mut out = Vec::with_capacity(data.len() + AUTO_DETECT_HEADER_PREFIX);
+    out.push(header_length);
+    out.push(header_type_id);
+    out.extend_from_slice(data);
+    out
+}
+
+/// Drops the `headerLength` + `headerTypeId` prefix so the encoded structure can be
+/// carried as `TunnelSubHeader::data`, whose encoder writes that prefix itself.
+fn strip_auto_detect_header(mut encoded: Vec<u8>) -> Vec<u8> {
+    encoded.drain(..AUTO_DETECT_HEADER_PREFIX.min(encoded.len()));
+    encoded
 }
