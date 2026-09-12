@@ -323,6 +323,12 @@ impl UdpTransport {
         }
     }
 
+    /// The RDP-UDP protocol version the handshake settled on: 1 or 2 for the
+    /// MS-RDPEUDP data transfer, 3 for MS-RDPEUDP2.
+    pub fn negotiated_version(&self) -> Option<u16> {
+        self.shared.lock().ok().and_then(|shared| shared.negotiated_version)
+    }
+
     /// Whether the driver task is still running.
     pub fn is_alive(&self) -> bool {
         !self.driver_handle.is_finished()

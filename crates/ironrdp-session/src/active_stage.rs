@@ -25,7 +25,7 @@ use ironrdp_pdu::window::{
 use ironrdp_pdu::{Action, mcs};
 use ironrdp_rdpei::RdpeiClient;
 use ironrdp_svc::{StaticChannelSet, SvcMessage, SvcProcessor, SvcProcessorMessages};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::fast_path::UpdateKind;
 use crate::image::DecodedImage;
@@ -545,10 +545,26 @@ impl ActiveStage {
     ///
     /// Returns the union of the changed regions, or `None` when nothing was pending.
     fn drain_graphics_pipeline(&mut self, image: &mut DecodedImage) -> SessionResult<Option<InclusiveRectangle>> {
-        let graphics_updates = self
-            .get_dvc_mut::<GraphicsPipelineClient>()
-            .map(|mut gfx| gfx.processor_mut().drain_output())
-            .unwrap_or_default();
+        let Some(mut gfx) = self.get_dvc_mut::<GraphicsPipelineClient>() else {
+            return Ok(None);
+        };
+        // A Display Control resize on the graphics pipeline completes with a
+        // `ResetGraphics` declaring the new output size, not with a reactivation.
+        // Follow it: the deltas that come next are clipped to that size and would
+        // all be dropped against the old framebuffer.
+        if let Some((width, height)) = gfx.processor().output_size()
+            && (width, height) != (image.width(), image.height())
+        {
+            info!(
+                from_width = image.width(),
+                from_height = image.height(),
+                width,
+                height,
+                "Graphics output resized by ResetGraphics; resizing the framebuffer"
+            );
+            image.resize(width, height);
+        }
+        let graphics_updates = gfx.processor_mut().drain_output();
         composite_graphics_updates(image, graphics_updates.into_iter().map(|u| (u.region, u.data)))
     }
 

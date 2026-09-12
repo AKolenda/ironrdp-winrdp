@@ -79,6 +79,10 @@ pub(crate) struct SharedIo {
 
     /// Set when the RDPEUDP2 connection has been cleanly shut down.
     pub(crate) closed: bool,
+
+    /// The RDP-UDP protocol version the handshake settled on (1, 2 or 3),
+    /// recorded by the driver when `Event::Connected` fires.
+    pub(crate) negotiated_version: Option<u16>,
 }
 
 impl SharedIo {
@@ -93,6 +97,7 @@ impl SharedIo {
             write_room_waker: None,
             error: None,
             closed: false,
+            negotiated_version: None,
         }
     }
 

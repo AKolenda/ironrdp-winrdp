@@ -489,6 +489,18 @@ impl GraphicsPipelineClient {
     /// drains the accumulated output-space deltas, committed per `EndFrame` and
     /// ready to blit into a framebuffer. Each call empties the queue.
     #[must_use]
+    /// The graphics output size the server declared with its last `ResetGraphics`.
+    ///
+    /// The server answers a Display Control resize with a `ResetGraphics` carrying the
+    /// new size rather than a Deactivation-Reactivation Sequence, so this is where a
+    /// resize completes on the graphics pipeline. `None` until the first reset.
+    pub fn output_size(&self) -> Option<(u16, u16)> {
+        match self.compositor.output_size() {
+            (0, _) | (_, 0) => None,
+            size => Some(size),
+        }
+    }
+
     pub fn drain_output(&mut self) -> Vec<OutputUpdate> {
         self.compositor.drain_output()
     }

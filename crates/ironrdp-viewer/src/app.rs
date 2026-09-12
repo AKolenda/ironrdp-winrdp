@@ -637,6 +637,12 @@ impl RpcApp {
             RdpOutputEvent::RailControl(control) => {
                 debug!(?control, "RAIL control received");
             }
+            RdpOutputEvent::Transport {
+                reliable_udp,
+                udp_version,
+            } => {
+                info!(reliable_udp, udp_version, "Session transport");
+            }
             RdpOutputEvent::WindowingOrders(_) => {}
         }
     }

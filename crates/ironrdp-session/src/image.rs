@@ -169,6 +169,19 @@ impl DecodedImage {
         }
     }
 
+    /// Re-create the framebuffer at a new size, keeping the pointer sprite and its
+    /// visibility. Every pixel is cleared; the server repaints after a resize.
+    pub fn resize(&mut self, width: u16, height: u16) {
+        if (width, height) == (self.width, self.height) {
+            return;
+        }
+        let pointer = self.pointer.take();
+        let show_pointer = self.show_pointer;
+        *self = Self::new(self.pixel_format, width, height);
+        self.pointer = pointer;
+        self.show_pointer = show_pointer;
+    }
+
     pub fn pixel_format(&self) -> PixelFormat {
         self.pixel_format
     }
