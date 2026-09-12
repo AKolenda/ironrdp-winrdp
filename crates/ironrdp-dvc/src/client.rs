@@ -462,11 +462,15 @@ impl DrdynvcClient {
 
     fn process_data(&mut self, data: DrdynvcDataPdu) -> PduResult<Vec<SvcMessage>> {
         let channel_id = data.channel_id();
-        let messages = self
-            .dynamic_channels
-            .get_by_channel_id_mut(channel_id)
-            .ok_or_else(|| pdu_other_err!("access to non existing DVC channel"))?
-            .process(data)?;
+        // MS-RDPEDYC 3.2.5.1.4: data for a channel this client has not opened, or has
+        // declined, is dropped rather than treated as a protocol failure. GNOME Remote
+        // Desktop, for one, keeps sending on channels the client answered with
+        // NO_LISTENER.
+        let Some(channel) = self.dynamic_channels.get_by_channel_id_mut(channel_id) else {
+            debug!(channel_id, "Dropping data for a dynamic channel that is not open");
+            return Ok(Vec::new());
+        };
+        let messages = channel.process(data)?;
 
         encode_dvc_messages(channel_id, messages, ChannelFlags::empty()).map_err(|e| encode_err!(e))
     }

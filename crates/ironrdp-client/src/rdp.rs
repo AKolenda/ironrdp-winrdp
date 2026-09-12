@@ -9,7 +9,6 @@ use std::io;
 use std::sync::Arc;
 #[cfg(feature = "location")]
 use std::sync::mpsc as std_mpsc;
-#[cfg(feature = "location")]
 use std::time::Instant;
 
 #[cfg(feature = "clipboard")]
@@ -193,6 +192,17 @@ pub enum RdpOutputEvent {
     /// A cookie-based reconnect has completed successfully.
     AutoReconnected,
     Terminated(SessionResult<GracefulDisconnectReason>),
+    /// The transport carrying graphics and dynamic channels changed.
+    ///
+    /// Sent once the session is active and again whenever the reliable RDP-UDP
+    /// tunnel takes over (after DVC Soft-Sync) or drops back to TCP.
+    Transport {
+        /// Graphics and dynamic channels flow over the reliable RDP-UDP tunnel.
+        reliable_udp: bool,
+        /// The negotiated RDP-UDP protocol version (1, 2 or 3) while a tunnel is
+        /// open, whether or not Soft-Sync has moved traffic onto it yet.
+        udp_version: Option<u16>,
+    },
 }
 
 impl RdpOutputEvent {
@@ -708,14 +718,21 @@ impl RdpClient {
         // ── Clipboard initialisation (compile-time gated) ─────────────────────
         //
         // On Windows the WinClipboard object must outlive the entire connection loop, so we
-        // keep it alive via `_win_clipboard`.  On non-Windows a StubClipboard backend is used
-        // and its ownership can be released immediately after the factory is extracted.
+        // keep it alive via `_win_clipboard`; the same goes for LinuxClipboard and
+        // `_linux_clipboard`. Elsewhere a StubClipboard backend is used and its ownership can
+        // be released immediately after the factory is extracted.
         #[cfg(all(windows, feature = "clipboard"))]
         #[expect(
             clippy::collection_is_never_read,
             reason = "binding owns the Windows clipboard so it stays alive for the connection's lifetime"
         )]
         let _win_clipboard;
+        #[cfg(all(target_os = "linux", feature = "clipboard"))]
+        #[expect(
+            clippy::collection_is_never_read,
+            reason = "binding owns the Linux clipboard so it stays alive for the connection's lifetime"
+        )]
+        let _linux_clipboard;
 
         #[cfg(feature = "clipboard")]
         let cliprdr_factory: Option<Box<dyn CliprdrBackendFactory + Send>>;
@@ -730,12 +747,20 @@ impl RdpClient {
                     {
                         _win_clipboard = None;
                     }
+                    #[cfg(target_os = "linux")]
+                    {
+                        _linux_clipboard = None;
+                    }
                 }
                 (ClipboardType::Disable, _) => {
                     cliprdr_factory = None;
                     #[cfg(windows)]
                     {
                         _win_clipboard = None;
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        _linux_clipboard = None;
                     }
                 }
                 (ClipboardType::Stub, _) => {
@@ -745,6 +770,10 @@ impl RdpClient {
                     #[cfg(windows)]
                     {
                         _win_clipboard = None;
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        _linux_clipboard = None;
                     }
                 }
                 (ClipboardType::Enable, None) => {
@@ -770,7 +799,26 @@ impl RdpClient {
                         }
                     }
 
-                    #[cfg(not(windows))]
+                    #[cfg(target_os = "linux")]
+                    {
+                        use crate::clipboard::ClientClipboardMessageProxy;
+                        use ironrdp_cliprdr_native::{LinuxClipboard, StubClipboard};
+                        match LinuxClipboard::new(ClientClipboardMessageProxy::new(self.input_event_sender.clone())) {
+                            Ok(clipboard) => {
+                                cliprdr_factory = Some(clipboard.backend_factory());
+                                _linux_clipboard = Some(clipboard);
+                            }
+                            Err(error) => {
+                                // A desktop clipboard is optional: without a display there is
+                                // nothing to bridge, and the session is still useful.
+                                warn!(%error, "OS clipboard unavailable; clipboard redirection is off for this session");
+                                cliprdr_factory = Some(StubClipboard::new().backend_factory());
+                                _linux_clipboard = None;
+                            }
+                        }
+                    }
+
+                    #[cfg(not(any(windows, target_os = "linux")))]
                     {
                         use ironrdp_cliprdr_native::StubClipboard;
                         let stub = StubClipboard::new();
@@ -2804,6 +2852,8 @@ struct PerfCounters {
     busy_total: Duration,
     last_frames: u32,
     first_frames: Option<u32>,
+    /// The `(reliable_udp, udp_version)` pair last announced as `RdpOutputEvent::Transport`.
+    announced_transport: Option<(bool, Option<u16>)>,
 }
 
 impl PerfCounters {
@@ -2820,7 +2870,27 @@ impl PerfCounters {
             busy_total: Duration::ZERO,
             last_frames: 0,
             first_frames: None,
+            announced_transport: None,
         }
+    }
+
+    /// The `Transport` event to send when the transport state differs from the
+    /// last one announced; `None` while it is unchanged.
+    fn transport_event_if_changed(
+        &mut self,
+        active_stage: &ActiveStage,
+        udp_version: Option<u16>,
+    ) -> Option<RdpOutputEvent> {
+        let current = (active_stage.reliable_udp_dvc_tunnel_in_use(), udp_version);
+        if self.announced_transport == Some(current) {
+            return None;
+        }
+        self.announced_transport = Some(current);
+        info!(reliable_udp = current.0, udp_version = current.1, "session transport");
+        Some(RdpOutputEvent::Transport {
+            reliable_udp: current.0,
+            udp_version: current.1,
+        })
     }
 
     fn report_if_due(&mut self, active_stage: &ActiveStage) {
@@ -3053,6 +3123,7 @@ async fn active_session(
     let mut post_logon_redraw_requested = false;
     let mut pending_udp_payload: Option<Vec<u8>> = None;
     let mut perf = PerfCounters::new();
+    let mut framebuffer_size = (image.width(), image.height());
     let mut initial_outputs = if *graceful_close_receiver.borrow_and_update() {
         graceful_shutdown_sent = true;
         Some(active_stage.graceful_shutdown()?)
@@ -3675,6 +3746,26 @@ async fn active_session(
         };
 
         perf.report_if_due(&active_stage);
+        if framebuffer_size != (image.width(), image.height()) {
+            // The graphics pipeline resized the framebuffer (see
+            // `ActiveStage::drain_graphics_pipeline`); that is how a resize completes
+            // on EGFX, so stop waiting for a reactivation that will not come.
+            framebuffer_size = (image.width(), image.height());
+            if resize_queue.in_flight.take().is_some() {
+                info!(width = framebuffer_size.0, height = framebuffer_size.1, "Resize completed by the graphics pipeline");
+            }
+        }
+        #[cfg(feature = "udp")]
+        let udp_version = udp_tunnel.transport.as_ref().and_then(|t| t.negotiated_version());
+        #[cfg(not(feature = "udp"))]
+        let udp_version = None;
+        if let Some(event) = perf.transport_event_if_changed(&active_stage, udp_version) {
+            if !send_active_output_event(output_event_sender, event, close_receiver).await? {
+                return Ok(RdpControlFlow::TerminatedGracefully(
+                    GracefulDisconnectReason::UserInitiated,
+                ));
+            }
+        }
 
         if let Some(batch) = iteration.dvc_batch {
             let channel_id = batch.channel_id();

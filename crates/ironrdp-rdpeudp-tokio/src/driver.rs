@@ -154,7 +154,9 @@ impl Driver {
                 result = self.socket.recv(&mut self.recv_buf), if has_room => {
                     let n = result.map_err(|error| DriverError::socket("receive datagram", error))?;
                     let now = self.clock.now();
-                    if self.conn.is_established() && rx_logged < 8 {
+                    if !self.conn.is_established() {
+                        tracing::debug!(len = n, head = %hex_head(&self.recv_buf[..n]), "udp rx handshake datagram");
+                    } else if rx_logged < 8 {
                         rx_logged += 1;
                         tracing::debug!(len = n, head = %hex_head(&self.recv_buf[..n]), "udp rx datagram");
                     }
@@ -270,7 +272,9 @@ impl Driver {
             } else {
                 pad_handshake_datagram(transmit.contents)
             };
-            if self.conn.is_established() && self.tx_logged < 8 {
+            if !self.conn.is_established() {
+                tracing::debug!(len = bytes.len(), head = %hex_head(&bytes), "udp tx handshake datagram");
+            } else if self.tx_logged < 8 {
                 self.tx_logged += 1;
                 tracing::debug!(len = bytes.len(), head = %hex_head(&bytes), "udp tx datagram");
             }
@@ -333,6 +337,11 @@ impl Driver {
                 Event::Connected => {
                     if !self.connected_signaled {
                         self.connected_signaled = true;
+                        let version = self.conn.negotiated_version();
+                        if let Ok(mut shared) = self.shared.lock() {
+                            shared.negotiated_version = version;
+                        }
+                        tracing::info!(version, "RDP-UDP handshake complete");
                         self.connected_notify.notify_one();
                     }
                 }
