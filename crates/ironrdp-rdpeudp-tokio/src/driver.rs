@@ -346,8 +346,12 @@ impl Driver {
             match event {
                 Event::Connected => {
                     if !self.connected_signaled {
-                        debug!("RDP-UDP handshake complete");
+                        let version = self.conn.negotiated_version();
+                        debug!(?version, "RDP-UDP handshake complete");
                         self.connected_signaled = true;
+                        if let Ok(mut shared) = self.shared.lock() {
+                            shared.negotiated_version = version;
+                        }
                         self.connected_notify.notify_one();
                     }
                 }

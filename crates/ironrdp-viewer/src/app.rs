@@ -622,6 +622,8 @@ impl RpcApp {
                 debug!(?control, "RAIL control received");
             }
             RdpOutputEvent::WindowingOrders(_) => {}
+            // The client logs the transport itself.
+            RdpOutputEvent::Transport { .. } => {}
             // Only produced when the client is built with `.with_desktop_updates()`, which the
             // viewer does not opt into: it always presents full-frame `Image` snapshots instead.
             RdpOutputEvent::DesktopUpdate(_) => {}
