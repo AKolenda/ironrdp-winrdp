@@ -126,7 +126,7 @@ impl Driver {
     async fn run_to_completion(&mut self) -> Result<(), DriverError> {
         // Send any initial transmits (the SYN packet for client-side connections)
         self.drain_transmits().await?;
-        let mut stats_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut stats_tick = tokio::time::interval(core::time::Duration::from_secs(1));
         let mut rx_logged = 0u32;
 
         loop {

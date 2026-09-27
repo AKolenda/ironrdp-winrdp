@@ -6,11 +6,11 @@ use std::os::unix::fs::MetadataExt;
 use ironrdp_core::impl_as_any;
 use ironrdp_pdu::{PduResult, encode_err};
 use ironrdp_rdpdr::pdu::RdpdrPdu;
+use ironrdp_rdpdr::pdu::efs::*;
+use ironrdp_rdpdr::pdu::esc::{ScardCall, ScardIoCtlCode};
 use ironrdp_rdpdr::{
     RdpdrBackend, RdpdrBackendFactory, RdpdrBackendFactoryResult, RdpdrBackendProduct, RdpdrDrive, RdpdrPrinter,
 };
-use ironrdp_rdpdr::pdu::efs::*;
-use ironrdp_rdpdr::pdu::esc::{ScardCall, ScardIoCtlCode};
 use ironrdp_svc::SvcMessage;
 use nix::dir::{Dir, OwningIter};
 
@@ -119,9 +119,11 @@ impl RdpdrBackend for NixRdpdrBackend {
     fn handle_printer_io_request(&mut self, req: PrinterIoRequest) -> PduResult<Vec<SvcMessage>> {
         match self.printer.as_mut() {
             Some(spooler) => spooler.handle(req),
-            None => Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCloseResponse(DeviceCloseResponse {
-                device_io_response: DeviceIoResponse::new(req.into_device_io_request(), NtStatus::NOT_SUPPORTED),
-            }))]),
+            None => Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCloseResponse(
+                DeviceCloseResponse {
+                    device_io_response: DeviceIoResponse::new(req.into_device_io_request(), NtStatus::NOT_SUPPORTED),
+                },
+            ))]),
         }
     }
     fn reject_printer_write(&mut self, req: DeviceIoRequest) -> PduResult<Vec<SvcMessage>> {

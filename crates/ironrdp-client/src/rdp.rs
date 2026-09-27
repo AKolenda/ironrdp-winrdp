@@ -2893,6 +2893,10 @@ impl PerfCounters {
         })
     }
 
+    #[expect(
+        clippy::as_conversions,
+        reason = "u64-to-f64 loses precision only above 2^53 bytes, acceptable for a log line"
+    )]
     fn report_if_due(&mut self, active_stage: &ActiveStage) {
         let elapsed = self.last_report.elapsed();
         if elapsed < Duration::from_secs(1) {
@@ -2937,15 +2941,17 @@ impl PerfCounters {
     }
 
     fn account_tcp(&mut self, len: usize, busy: Duration) {
-        self.tcp_bytes += len as u64;
-        self.tcp_bytes_total += len as u64;
+        let len = u64::try_from(len).unwrap_or(u64::MAX);
+        self.tcp_bytes += len;
+        self.tcp_bytes_total += len;
         self.busy += busy;
         self.busy_total += busy;
     }
 
     fn account_udp(&mut self, len: usize, busy: Duration) {
-        self.udp_bytes += len as u64;
-        self.udp_bytes_total += len as u64;
+        let len = u64::try_from(len).unwrap_or(u64::MAX);
+        self.udp_bytes += len;
+        self.udp_bytes_total += len;
         self.busy += busy;
         self.busy_total += busy;
     }

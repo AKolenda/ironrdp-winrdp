@@ -959,8 +959,11 @@ impl RdpeudpConnection {
             recv_highest: recv_window.highest_seq(),
             recv_reorder: recv_window.reorder_buf_len(),
             recv_has_gaps: recv_window.has_gaps(),
-            srtt_ms: self.rtt.srtt().map(|d| d.as_millis() as u64),
-            rto_ms: self.effective_rto().as_millis() as u64,
+            srtt_ms: self
+                .rtt
+                .srtt()
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+            rto_ms: u64::try_from(self.effective_rto().as_millis()).unwrap_or(u64::MAX),
         })
     }
 
@@ -2093,13 +2096,11 @@ impl RdpeudpConnection {
 
         self.timers.set(Timer::KeepAlive, now + self.config.keep_alive_interval);
     }
-}
 
-// ════════════════════════════════════════════════════════════════════
-// MS-RDPEUDP version 1/2 data transfer (reliable mode)
-// ════════════════════════════════════════════════════════════════════
+    // ════════════════════════════════════════════════════════════════════
+    // MS-RDPEUDP version 1/2 data transfer (reliable mode)
+    // ════════════════════════════════════════════════════════════════════
 
-impl RdpeudpConnection {
     /// Handles an established-state datagram in `RDPUDP_FEC_HEADER` framing.
     fn handle_v1_datagram(&mut self, wire: &[u8], now: MonotonicInstant) -> Result<(), RdpeudpError> {
         let datagram: V1Datagram = decode(wire).map_err(RdpeudpError::decode)?;
@@ -2620,10 +2621,6 @@ mod tests {
 #[cfg(test)]
 mod v1_tests {
     use super::*;
-    use crate::pdu::{
-        SynDataExPayload, SynDataPayload, SynExFlags, UdpVersion, V1AckVectorElement, V1AckVectorHeader,
-        VectorElementState,
-    };
 
     const LOCAL_ISN: u32 = 5000;
     const REMOTE_ISN: u32 = 1000;

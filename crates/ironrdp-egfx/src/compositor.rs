@@ -1145,14 +1145,21 @@ mod tests {
 
         c.reset(1920, 1080);
         assert_eq!(c.cache.len(), 1, "reset keeps the bitmap cache");
-        assert_eq!(c.allocated_bytes, cached, "only the cache's charge remains after a reset");
+        assert_eq!(
+            c.allocated_bytes, cached,
+            "only the cache's charge remains after a reset"
+        );
 
         // And the kept tile is still usable on a surface created after the reset.
         c.create_surface(2, 16, 16);
         c.map_surface(2, 0, 0);
         c.cache_to_surface(7, 2, &[Point { x: 0, y: 0 }]);
         c.end_frame();
-        assert_eq!(c.drain_output().len(), 1, "a cache paste after the reset still produces output");
+        assert_eq!(
+            c.drain_output().len(),
+            1,
+            "a cache paste after the reset still produces output"
+        );
     }
 
     /// Cache slots are a second allocation pool keyed by `u16`. Charging them against

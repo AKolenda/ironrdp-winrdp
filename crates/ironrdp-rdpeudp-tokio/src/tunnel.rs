@@ -342,8 +342,9 @@ impl AutoDetectResponder {
         use ironrdp_rdpemt::{SubHeaderType, TunnelData, TunnelSubHeader};
 
         let mut responses = Vec::new();
+        let pdu_len = u64::try_from(pdu_len).unwrap_or(u64::MAX);
         if self.bandwidth_started_at.is_some() {
-            self.bandwidth_bytes += pdu_len as u64;
+            self.bandwidth_bytes = self.bandwidth_bytes.saturating_add(pdu_len);
         }
         for sub_header in sub_headers {
             if sub_header.sub_header_type != SubHeaderType::AutoDetectRequest {
@@ -370,11 +371,13 @@ impl AutoDetectResponder {
                 AutoDetectRequest::BandwidthMeasureStart { .. } => {
                     self.bandwidth_started_at = Some(std::time::Instant::now());
                     // The PDU carrying the Start opens the window and is part of it.
-                    self.bandwidth_bytes = pdu_len as u64;
+                    self.bandwidth_bytes = pdu_len;
                     None
                 }
                 AutoDetectRequest::BandwidthMeasurePayload { payload, .. } => {
-                    self.bandwidth_bytes += payload.len() as u64;
+                    self.bandwidth_bytes = self
+                        .bandwidth_bytes
+                        .saturating_add(u64::try_from(payload.len()).unwrap_or(u64::MAX));
                     None
                 }
                 AutoDetectRequest::BandwidthMeasureStop {
@@ -382,7 +385,8 @@ impl AutoDetectResponder {
                     request_type,
                     payload,
                 } => {
-                    self.bandwidth_bytes += payload.map_or(0, |p| p.len() as u64);
+                    let payload_len = payload.map_or(0, |p| u64::try_from(p.len()).unwrap_or(u64::MAX));
+                    self.bandwidth_bytes = self.bandwidth_bytes.saturating_add(payload_len);
                     // Floor at 1 ms: the server computes byteCount * 8 / timeDelta
                     // (MS-RDPBCGR 3.3.5.14), and a LAN probe can complete inside a millisecond.
                     let elapsed = self
