@@ -155,10 +155,10 @@ impl Driver {
                     let n = result.map_err(|error| DriverError::socket("receive datagram", error))?;
                     let now = self.clock.now();
                     if !self.conn.is_established() {
-                        tracing::debug!(len = n, head = %hex_head(&self.recv_buf[..n]), "udp rx handshake datagram");
+                        tracing::trace!(len = n, head = %hex_head(&self.recv_buf[..n]), "Received a handshake datagram");
                     } else if rx_logged < 8 {
                         rx_logged += 1;
-                        tracing::debug!(len = n, head = %hex_head(&self.recv_buf[..n]), "udp rx datagram");
+                        tracing::trace!(len = n, head = %hex_head(&self.recv_buf[..n]), "Received a datagram");
                     }
 
                     // handle_datagram takes &mut [u8] for in-place prefix byte swap
@@ -225,7 +225,7 @@ impl Driver {
                 }
                 _ = stats_tick.tick() => {
                     if let Some(stats) = self.conn.v1_stats() {
-                        tracing::debug!(?stats, "udp v1 tunnel");
+                        tracing::trace!(?stats, "RDP-UDP version 1/2 connection statistics");
                     }
                 }
             }
@@ -273,10 +273,10 @@ impl Driver {
                 pad_handshake_datagram(transmit.contents)
             };
             if !self.conn.is_established() {
-                tracing::debug!(len = bytes.len(), head = %hex_head(&bytes), "udp tx handshake datagram");
+                tracing::trace!(len = bytes.len(), head = %hex_head(&bytes), "Sending a handshake datagram");
             } else if self.tx_logged < 8 {
                 self.tx_logged += 1;
-                tracing::debug!(len = bytes.len(), head = %hex_head(&bytes), "udp tx datagram");
+                tracing::trace!(len = bytes.len(), head = %hex_head(&bytes), "Sending a datagram");
             }
 
             self.socket
@@ -496,6 +496,16 @@ fn is_droppable(error: &RdpeudpError) -> bool {
             | RdpeudpErrorKind::InvalidPacket { .. }
             | RdpeudpErrorKind::InvalidState
     )
+}
+
+/// The first 48 bytes of a datagram in hex, for trace-level diagnostics.
+fn hex_head(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(48)
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -963,13 +973,4 @@ mod tests {
         driver_handle.abort();
         drop(unresponsive_peer);
     }
-}
-
-fn hex_head(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .take(48)
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ")
 }
