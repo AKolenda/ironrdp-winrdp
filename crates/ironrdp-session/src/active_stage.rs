@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
+use ironrdp_autodetect::AutoDetectState;
 use ironrdp_bulk::{BulkCompressor, CompressionType as BulkCompressionType};
-use ironrdp_core::{ReadCursor, WriteBuf};
+use ironrdp_core::{Decode as _, MonotonicInstant, ReadCursor, WriteBuf};
 use ironrdp_displaycontrol::client::DisplayControlClient;
 use ironrdp_dvc::pdu::SoftSyncTunnelType;
 use ironrdp_dvc::{DrdynvcClient, DvcClientProcessor, DvcMessageBatch, DynamicChannelMut, DynamicChannelRef};
 use ironrdp_egfx::client::GraphicsPipelineClient;
 use ironrdp_graphics::pointer::DecodedPointer;
+use ironrdp_pdu::fast_path::FastPathHeader;
 use ironrdp_pdu::gcc::{ChannelName, Monitor};
 use ironrdp_pdu::geometry::{ExclusiveRectangle, InclusiveRectangle, Rectangle as _};
 use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
@@ -193,15 +195,38 @@ impl ActiveStage {
     }
 
     /// Process a frame received from the server.
+    ///
+    /// Without an arrival time, continuous bandwidth results report zero bytes;
+    /// connect-time results count only the Stop message. See [`Self::process_with_timestamp`].
     pub fn process(
         &mut self,
         image: &mut DecodedImage,
         action: Action,
         frame: &[u8],
     ) -> SessionResult<Vec<ActiveStageOutput>> {
+        self.process_with_timestamp(image, action, frame, None)
+    }
+
+    /// Process a frame received from the server, together with its arrival time.
+    ///
+    /// The clock stays outside this state machine: `received_at` is the time the transport
+    /// read the frame, from the same monotonic clock for every frame. Frames that were
+    /// buffered must keep their read time so a bandwidth measurement reflects network arrival
+    /// rather than the time spent decoding earlier frames.
+    pub fn process_with_timestamp(
+        &mut self,
+        image: &mut DecodedImage,
+        action: Action,
+        frame: &[u8],
+        received_at: Option<MonotonicInstant>,
+    ) -> SessionResult<Vec<ActiveStageOutput>> {
         self.damage_regions.clear();
         let (mut stage_outputs, processor_updates) = match action {
             Action::FastPath => {
+                // A continuous bandwidth measurement counts what follows the fast-path header.
+                let mut header = ReadCursor::new(frame);
+                FastPathHeader::decode(&mut header).map_err(SessionError::decode)?;
+                self.x224_processor.record_bandwidth_bytes(header.len());
                 let mut output = WriteBuf::new();
                 let processor_updates =
                     self.fast_path_processor
@@ -212,7 +237,9 @@ impl ActiveStage {
                 )
             }
             Action::X224 => {
-                let x224_outputs = self.x224_processor.process(frame, &mut self.bulk_decompressor)?;
+                let x224_outputs =
+                    self.x224_processor
+                        .process_with_timestamp(frame, &mut self.bulk_decompressor, received_at)?;
                 let mut stage_outputs = Vec::new();
                 let mut processor_updates = Vec::new();
 
@@ -491,6 +518,11 @@ impl ActiveStage {
     /// Encodes an Initiate Multitransport Response on the negotiated MCS message channel.
     pub fn encode_multitransport_response(&self, response: &MultitransportResponsePdu) -> SessionResult<Vec<u8>> {
         self.x224_processor.encode_multitransport_response(response)
+    }
+
+    /// Borrows network detection state for transfer to and from a reactivation sequence.
+    pub fn autodetect_state_mut(&mut self) -> &mut AutoDetectState {
+        self.x224_processor.autodetect_state_mut()
     }
 
     pub fn get_svc_processor<T: SvcProcessor + 'static>(&mut self) -> Option<&T> {
@@ -1078,7 +1110,7 @@ mod tests {
     use core::any::TypeId;
 
     use super::*;
-    use ironrdp_core::{Decode as _, encode_vec};
+    use ironrdp_core::encode_vec;
     use ironrdp_displaycontrol::pdu::{DisplayControlCapabilities, DisplayControlPdu};
     use ironrdp_dvc::pdu::{
         ClosePdu, CreateRequestPdu, DataPdu, DrdynvcDataPdu, DrdynvcServerPdu, SoftSyncChannelList, SoftSyncRequestPdu,

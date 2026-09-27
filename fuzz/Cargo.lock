@@ -370,6 +370,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironrdp-autodetect"
+version = "0.1.0"
+dependencies = [
+ "ironrdp-core",
+ "ironrdp-pdu",
+]
+
+[[package]]
 name = "ironrdp-bulk"
 version = "0.1.1"
 
@@ -451,6 +459,7 @@ name = "ironrdp-fuzzing"
 version = "0.0.0"
 dependencies = [
  "arbitrary",
+ "ironrdp-autodetect",
  "ironrdp-bulk",
  "ironrdp-cliprdr",
  "ironrdp-cliprdr-format",

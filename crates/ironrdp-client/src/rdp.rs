@@ -49,11 +49,9 @@ use ironrdp_rdpei::RdpeiClient;
 use ironrdp_rdpei::pdu::TouchEventPdu;
 #[cfg(feature = "location")]
 use ironrdp_rdpel::client::LocationClient;
-#[cfg(any(feature = "clipboard", feature = "rdpdr"))]
-use ironrdp_session::ActiveStage;
 use ironrdp_session::image::DecodedImage;
 use ironrdp_session::{
-    ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason, SessionErrorExt as _, SessionResult,
+    ActiveStage, ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason, SessionErrorExt as _, SessionResult,
 };
 use ironrdp_svc::SvcMessage;
 use ironrdp_tokio::reqwest::ReqwestNetworkClient;
@@ -3274,7 +3272,8 @@ async fn active_session(
                         Err(error) => return Err(ironrdp_session::custom_err!("read frame", error)),
                     };
                     trace!(?action, frame_length = payload.len(), "Frame received");
-                    let mut outputs = active_stage.process(&mut image, action, &payload)?;
+                    let mut outputs =
+                        active_stage.process_with_timestamp(&mut image, action, &payload, reader.last_read_at())?;
                     #[cfg(feature = "rdpdr")]
                     if let Some(output) = poll_deferred_rdpdr_output(&mut active_stage)? {
                         outputs.push(output);
@@ -4090,6 +4089,10 @@ async fn active_session(
                     // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
                     debug!("Executing Deactivation-Reactivation Sequence");
                     let mut connection_activation = activation_factory.create();
+                    core::mem::swap(
+                        active_stage.autodetect_state_mut(),
+                        connection_activation.autodetect_state_mut(),
+                    );
                     let mut buf = WriteBuf::new();
                     'activation_seq: loop {
                         let step = single_sequence_step_read(&mut reader, &mut connection_activation, &mut buf);
@@ -4183,6 +4186,10 @@ async fn active_session(
                             ) {
                                 return Err(ironrdp_session::general_err!("invalid static channel chunk size"));
                             }
+                            core::mem::swap(
+                                active_stage.autodetect_state_mut(),
+                                connection_activation.autodetect_state_mut(),
+                            );
                             active_stage.set_window_support_level(window_support_level);
                             if let Some(monitor_layout) = connection_activation.monitor_layout()
                                 && !send_active_output_event(

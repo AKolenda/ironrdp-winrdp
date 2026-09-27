@@ -1,0 +1,24 @@
+[package]
+name = "ironrdp-autodetect"
+version = "0.1.0"
+readme = "README.md"
+description = "RDP client network characteristics detection state machine"
+edition.workspace = true
+rust-version = "1.94"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["std"]
+std = ["ironrdp-core/std", "ironrdp-pdu/std"]
+
+[dependencies]
+ironrdp-core = { path = "../ironrdp-core", version = "0.2" }
+ironrdp-pdu = { path = "../ironrdp-pdu", version = "0.9", features = ["alloc"] }
+
+[lints]
+workspace = true

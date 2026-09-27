@@ -412,8 +412,8 @@ pub trait Sequence: Send {
     ///
     /// A driver that always passes `None` never opens a connect-time bandwidth
     /// window, so the Bandwidth Measure Results it sends report only the Stop's
-    /// own payload against the untimed floor. See `connection::counted_len`'s doc
-    /// for why the byte count is measurement-gated rather than reported in full.
+    /// own payload against a one-millisecond floor. Accumulated bytes without a
+    /// measured interval would otherwise overstate the observed bandwidth.
     fn step(
         &mut self,
         input: &[u8],
