@@ -10,6 +10,7 @@ doctest = false
 test = false
 
 [dependencies]
+ironrdp-autodetect.path = "../ironrdp-autodetect"
 arbitrary = { version = "1", features = ["derive"] }
 ironrdp-bulk.path = "../ironrdp-bulk"
 ironrdp-core.path = "../ironrdp-core"

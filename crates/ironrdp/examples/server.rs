@@ -27,7 +27,10 @@ use tracing::{debug, info, warn};
 
 const HELP: &str = "\
 USAGE:
-  cargo run --example=server -- [--bind-addr <SOCKET ADDRESS>] [--cert <CERTIFICATE>] [--key <CERTIFICATE KEY>] [--user USERNAME] [--pass PASSWORD] [--sec tls|hybrid]
+  cargo run --example=server -- [--bind-addr <SOCKET ADDRESS>] [--cert <CERTIFICATE>] [--key <CERTIFICATE KEY>] [--user USERNAME] [--pass PASSWORD] [--sec tls|hybrid] [--autodetect <MILLISECONDS>]
+
+  --autodetect  run network auto-detection (MS-RDPBCGR 2.2.14) on the message channel: an RTT
+                probe every MILLISECONDS, and every eighth probe a bandwidth measurement
 ";
 
 #[tokio::main(flavor = "current_thread")]
@@ -54,7 +57,8 @@ async fn main() -> Result<(), anyhow::Error> {
             pass,
             cert,
             key,
-        } => run(bind_addr, hybrid, user, pass, cert, key).await,
+            autodetect_interval,
+        } => run(bind_addr, hybrid, user, pass, cert, key, autodetect_interval).await,
     }
 }
 
@@ -68,6 +72,7 @@ enum Action {
         pass: String,
         cert: Option<PathBuf>,
         key: Option<PathBuf>,
+        autodetect_interval: Option<Duration>,
     },
 }
 
@@ -94,6 +99,14 @@ fn parse_args() -> anyhow::Result<Action> {
         let user = args.opt_value_from_str("--user")?.unwrap_or_else(|| "user".to_owned());
         let pass = args.opt_value_from_str("--pass")?.unwrap_or_else(|| "pass".to_owned());
 
+        let autodetect_interval = args
+            .opt_value_from_str::<_, u64>("--autodetect")?
+            .map(Duration::from_millis);
+        anyhow::ensure!(
+            autodetect_interval.is_none_or(|interval| !interval.is_zero()),
+            "--autodetect interval must be greater than zero"
+        );
+
         Action::Run {
             bind_addr,
             hybrid,
@@ -101,6 +114,7 @@ fn parse_args() -> anyhow::Result<Action> {
             pass,
             cert,
             key,
+            autodetect_interval,
         }
     };
 
@@ -390,8 +404,9 @@ async fn run(
     password: String,
     cert: Option<PathBuf>,
     key: Option<PathBuf>,
+    autodetect_interval: Option<Duration>,
 ) -> anyhow::Result<()> {
-    info!(%bind_addr, ?cert, ?key, "run");
+    info!(%bind_addr, ?cert, ?key, ?autodetect_interval, "run");
 
     let handler = Handler::new();
 
@@ -428,6 +443,20 @@ async fn run(
         password,
         domain: None,
     }));
+
+    if let Some(interval) = autodetect_interval {
+        server.enable_autodetect();
+        let sender = server.event_sender().clone();
+        tokio::spawn(async move {
+            let mut ticks = time::interval(interval);
+            loop {
+                ticks.tick().await;
+                if sender.send(ServerEvent::AutoDetectRttRequest).is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     Ok(server.run().await?)
 }

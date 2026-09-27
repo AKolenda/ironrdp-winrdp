@@ -4,7 +4,8 @@ use core::net::SocketAddr;
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use ironrdp_core::{Encode, WriteBuf, decode, encode_vec};
+use ironrdp_autodetect::AutoDetectState;
+use ironrdp_core::{Decode as _, DecodeResult, Encode, ReadCursor, WriteBuf, decode, encode_vec};
 use ironrdp_pdu::rdp::capability_sets::WindowSupportLevel;
 use ironrdp_pdu::rdp::session_info::ServerAutoReconnect;
 use ironrdp_pdu::x224::X224;
@@ -26,75 +27,6 @@ use crate::{
 /// permitted to send during bootstrapping, per MS-RDPBCGR 2.2.15.1 (one per
 /// transport protocol: reliable + lossy UDP).
 const MAX_MULTITRANSPORT_REQUESTS: usize = 2;
-
-/// Size of the auto-detect header that precedes a Bandwidth Measure payload.
-///
-/// `headerLength` + `headerTypeId` + `sequenceNumber` + `requestType` +
-/// `payloadLength`, which [MS-RDPBCGR] 2.2.14.1.3 pins by requiring
-/// `headerLength` to be 0x08.
-const AUTO_DETECT_HEADER_LEN: u32 = 8;
-
-/// What one Bandwidth Measure message contributes to the Network Characteristics
-/// Byte Count store, and the canonical source for the connect-time bandwidth
-/// reasoning this file uses in several places (`UNMEASURABLE_INTERVAL_MS`, the
-/// `BandwidthMeasureStop` arm below, [`Sequence::step`]'s doc). Those restate
-/// only their own local decision plus a pointer here, so the reasoning behind
-/// each one stays single-sourced instead of drifting across independent copies.
-///
-/// **What is counted.** [MS-RDPBCGR] 3.2.5.14 gives connect-time detection
-/// exactly two accumulation steps, one on the Bandwidth Measure Payload and one
-/// on the 0x002B Stop, both reading "increment ... by the value specified in
-/// the **payloadLength** field plus the size of the header fields (8 bytes)".
-/// The section's other accumulation rule, the one that counts every byte
-/// received while the window is open, belongs to the 0x0014 and 0x0114 Starts,
-/// the reliable and lossy UDP variants. Connect-time is 0x1014, whose step list
-/// contains no such clause, so on this path the two per-message increments are
-/// the whole of the byte count.
-///
-/// **Which request types are in scope.** Only the 0x002B Stop, encapsulated in
-/// an Auto-Detect Request PDU during the connect-time phase, is handled here.
-/// [MS-RDPBCGR] 2.2.14.1.4 scopes the Auto-Detect-Request-PDU form of 0x0429 to
-/// *after* the RDP Connection Sequence has completed, so it cannot legitimately
-/// arrive here; its other form, and 0x0629, are tunneled over a multitransport
-/// channel this step never sees. The same 2.2.14.1.4 split sets `headerLength`
-/// to 0x08 for 0x002B and 0x06 otherwise, which is what fixes `AUTO_DETECT_HEADER_LEN`
-/// at 8 for this path specifically.
-///
-/// **Windows that could not be timed.** A driver whose `received_at` is always
-/// `None` never opens a window (see [`Sequence::step`]'s doc), so its Results
-/// report only the Stop's own payload against the untimed floor
-/// (`UNMEASURABLE_INTERVAL_MS`) rather than a full count divided by a
-/// `timeDelta` nobody measured. [MS-RDPBCGR] 3.2.5.14 states the Payload
-/// increment unconditionally; gating it on the window being open is a
-/// deliberate SHOULD-level deviation. It under-reports rather than over-reports
-/// (a server acting on 3.3.5.14 picks conservative settings for such a client),
-/// so it is not treated as a spec violation worth rejecting.
-///
-/// **This deliberately does not match FreeRDP.** FreeRDP counts the whole PDU
-/// length at the framing layer, `bandwidthMeasureByteCount += length` in
-/// `libfreerdp/core/rdp.c` after `rdp_read_header`, for any window including
-/// connect-time, and then adds `payloadLength` again in
-/// `libfreerdp/core/autodetect.c` for the Payload and the Stop. On the
-/// connect-time path that counts the payload twice and adds framing bytes the
-/// spec does not ask for. The figure is an informational QoS hint and the server
-/// proceeds either way, so following the spec costs no interop and is easier to
-/// justify than reproducing the reference's arithmetic. (This citation names
-/// files and expressions in a project outside this tree; it may drift as
-/// FreeRDP changes, and is not itself load-bearing for the decision above.)
-fn counted_len(payload_len: usize) -> u32 {
-    u32::try_from(payload_len)
-        .unwrap_or(u32::MAX)
-        .saturating_add(AUTO_DETECT_HEADER_LEN)
-}
-
-/// Reported as `timeDelta` when a connect-time bandwidth window was not timed.
-/// See [`counted_len`]'s doc for why an untimed window is reported at all.
-///
-/// One millisecond rather than zero, because a server computing
-/// `byteCount * 8 / timeDelta` divides by it ([MS-RDPBCGR] 3.3.5.14). It also
-/// floors a window that was timed and elapsed in under a millisecond, where it is
-/// a real bound rather than a stand-in.
-const UNMEASURABLE_INTERVAL_MS: u32 = 1;
 
 /// Outcome of a single multitransport bootstrapping request, passed to
 /// [`ClientConnector::complete_multitransport()`].
@@ -337,7 +269,7 @@ impl State for ClientConnectorState {
 
 #[expect(
     clippy::partial_pub_fields,
-    reason = "server response flags are negotiated internally and must not expand the public connector construction API; the connect-time bandwidth accumulators are likewise internal to the measurement, and exposing them would let a caller break the Start/Payload/Stop invariant"
+    reason = "server response flags are negotiated internally and must not expand the public connector construction API; the auto-detect state is internal to the measurement"
 )]
 #[derive(Debug)]
 pub struct ClientConnector {
@@ -362,18 +294,7 @@ pub struct ClientConnector {
     ///
     /// Set via [`ClientConnector::with_auto_reconnect_cookie`].
     pub auto_reconnect_cookie: Option<ServerAutoReconnect>,
-    /// Start of the in-flight connect-time bandwidth measurement window.
-    ///
-    /// Set when the server's Bandwidth Measure Start arrives, and only when the
-    /// driver reported an arrival time for it. Cleared when the matching Stop is
-    /// answered. `None` therefore means no window is open, whether because no Start
-    /// was seen or because this driver does not observe time at all.
-    connect_time_bw_started_at: Option<MonotonicInstant>,
-    /// Bytes seen in the open window, accumulated across Payload messages.
-    ///
-    /// Only accumulated while a window is open, since a total with no interval to
-    /// divide it by is not a measurement of anything.
-    connect_time_bw_bytes: u32,
+    autodetect: AutoDetectState,
 }
 
 impl ClientConnector {
@@ -389,8 +310,7 @@ impl ClientConnector {
             response_flags: nego::ResponseFlags::empty(),
             server_multitransport_flags: None,
             auto_reconnect_cookie: None,
-            connect_time_bw_started_at: None,
-            connect_time_bw_bytes: 0,
+            autodetect: AutoDetectState::default(),
         }
     }
 
@@ -856,139 +776,65 @@ impl ClientConnector {
         output: &mut WriteBuf,
     ) -> ConnectorResult<Written> {
         use ironrdp_pdu::rdp::autodetect::{
-            AutoDetectRequest, AutoDetectResponse, AutoDetectRspPdu, BW_RESULTS_CONNECT_TIME, BW_START_CONNECT_TIME,
-            BW_STOP_CONNECT_TIME,
+            AutoDetectRequest, AutoDetectRspPdu, BW_START_CONNECT_TIME, BW_STOP_CONNECT_TIME,
         };
 
+        // Continuous measurements belong to the active session or reactivation.
+        // Initial connection establishment only measures explicit payload messages.
         match request {
-            AutoDetectRequest::RttRequest { sequence_number, .. } => {
-                let response = AutoDetectRspPdu::new(AutoDetectResponse::RttResponse { sequence_number });
-                let written = encode_send_data_request(user_channel_id, message_channel_id, &response, output)?;
-                Written::from_size(written)
+            AutoDetectRequest::BandwidthMeasureStart { request_type, .. } if request_type != BW_START_CONNECT_TIME => {
+                return Ok(Written::Nothing);
             }
-            // Start opens the measurement window ([MS-RDPBCGR] 2.2.14.1.2). No reply is
-            // due; we only note when it arrived.
-            //
-            // Only the connect-time variant belongs to this phase. [MS-RDPBCGR]
-            // 3.2.5.14 gives 0x0014 and 0x0114, the reliable and lossy UDP Starts, a
-            // different procedure: they accumulate every byte received rather than
-            // just the Bandwidth Measure messages, and they are answered on a
-            // multitransport channel. Opening a connect-time window for one would
-            // measure the wrong thing and answer on the wrong channel, so they are
-            // left alone here.
-            //
-            // A driver that reports no arrival time cannot time this window, so it does
-            // not open one. That keeps the two unmeasurable situations distinct: a
-            // window that was timed and turned out to be short is still a measurement,
-            // while a driver with no clock never took one.
-            AutoDetectRequest::BandwidthMeasureStart { request_type, .. } if request_type == BW_START_CONNECT_TIME => {
-                self.connect_time_bw_started_at = received_at;
-                self.connect_time_bw_bytes = 0;
-                Ok(Written::Nothing)
-            }
-            // Payload carries the bytes whose transfer is being timed ([MS-RDPBCGR]
-            // 2.2.14.1.3). No reply is due; accumulate so Stop can report the total.
-            // With no window open there is nothing for the total to be divided by, so
-            // there is nothing worth accumulating.
-            //
-            // [MS-RDPBCGR] 3.2.5.14 increments the Byte Count store by payloadLength
-            // plus the size of the header fields (8 bytes: headerLength, headerTypeId,
-            // sequenceNumber, requestType, and payloadLength itself), not by
-            // payloadLength alone. `payload.len()` is exactly payloadLength, since
-            // decode reads that many bytes into it after consuming the header fields.
-            AutoDetectRequest::BandwidthMeasurePayload { payload, .. } => {
-                if self.connect_time_bw_started_at.is_some() {
-                    let len = counted_len(payload.len());
-                    self.connect_time_bw_bytes = self.connect_time_bw_bytes.saturating_add(len);
-                }
-                Ok(Written::Nothing)
-            }
-            // A connect-time Bandwidth Measure Stop ([MS-RDPBCGR] 2.2.14.1.4) warrants a
-            // Bandwidth Measure Results reply ([MS-RDPBCGR] 2.2.14.2.2), and only the
-            // 0x002B form is handled here; see `counted_len`'s doc for why, and for the
-            // byte-count and untimed-window reasoning this arm applies below.
-            //
-            // The reply is mandatory, not best-effort: FreeRDP-based servers (for
-            // example GNOME Remote Desktop) block in their AWAIT_BW_RESULT state until
-            // they receive it and never proceed to licensing without it, so omitting it
-            // stalls the whole connection.
-            AutoDetectRequest::BandwidthMeasureStop {
-                sequence_number,
-                request_type,
-                payload,
-            } if request_type == BW_STOP_CONNECT_TIME => {
-                let stop_bytes = payload.as_ref().map_or(0, |p| counted_len(p.len()));
-
-                // A window normally opens and closes on the same driver, so the same
-                // driver stamps both Start and this Stop. Nothing enforces that: a
-                // `Framed` rebuilt between the two (leftover bytes handed to a fresh
-                // `Framed`, which starts with no arrival time of its own) would open a
-                // window on one driver and close it on another with no reading, landing
-                // in the `(Some, None)` arm below. That arm silently drops whatever this
-                // window had accumulated; the debug log makes the drop visible instead of
-                // leaving it indistinguishable from the ordinary no-window case.
-                let (time_delta_ms, byte_count) = match (self.connect_time_bw_started_at, received_at) {
-                    (Some(started_at), Some(stopped_at)) => {
-                        let measured_ms =
-                            u32::try_from(stopped_at.duration_since(started_at).as_millis()).unwrap_or(u32::MAX);
-                        (
-                            measured_ms.max(UNMEASURABLE_INTERVAL_MS),
-                            self.connect_time_bw_bytes.saturating_add(stop_bytes),
-                        )
-                    }
-                    (Some(_), None) => {
-                        debug!(
-                            dropped_bytes = self.connect_time_bw_bytes,
-                            "Bandwidth Measure Stop arrived with no arrival time although its window was open; \
-                             dropping the accumulated count"
-                        );
-                        (UNMEASURABLE_INTERVAL_MS, stop_bytes)
-                    }
-                    (None, _) => (UNMEASURABLE_INTERVAL_MS, stop_bytes),
-                };
-
-                self.connect_time_bw_started_at = None;
-                self.connect_time_bw_bytes = 0;
-
-                let response = AutoDetectRspPdu::new(AutoDetectResponse::BandwidthMeasureResults {
-                    sequence_number,
-                    response_type: BW_RESULTS_CONNECT_TIME,
-                    time_delta_ms,
-                    byte_count,
-                });
-                let written = encode_send_data_request(user_channel_id, message_channel_id, &response, output)?;
-                Written::from_size(written)
-            }
-            // A Stop reaching here with any other requestType means a nonconformant
-            // server. [MS-RDPBCGR] 2.2.14.1.4 scopes 0x0429-via-Auto-Detect-Request-PDU
-            // to after the RDP Connection Sequence has completed, so during connect-time
-            // detection the only legitimate form on this channel is 0x002B, matched
-            // above; 0x0429 as a tunneled Sub-Header and 0x0629 both belong to a
-            // multitransport channel this step never sees. No reply is owed here per
-            // spec, but silently dropping it leaves nothing to debug a stalled
-            // connection with, so it is noted rather than swallowed like the truly
-            // expected continuous variants below.
-            AutoDetectRequest::BandwidthMeasureStop {
-                sequence_number,
-                request_type,
-                ..
-            } => {
-                warn!(
-                    sequence_number,
-                    request_type, "Unexpected Bandwidth Measure Stop requestType during connect-time auto-detection"
+            AutoDetectRequest::BandwidthMeasureStop { request_type, .. } if request_type != BW_STOP_CONNECT_TIME => {
+                debug!(
+                    request_type,
+                    "Ignoring continuous bandwidth request during connection establishment"
                 );
-                Ok(Written::Nothing)
+                return Ok(Written::Nothing);
             }
-            // The Network Characteristics Result is informational; nothing to send.
-            //
-            // This also catches the continuous-detection Bandwidth Measure Start,
-            // answered on a multitransport channel under a different procedure.
-            // Reaching it here means a server sent a continuous request during
-            // connect-time detection, which [MS-RDPBCGR] 3.2.5.14 does not provide for;
-            // ignoring is the conservative response.
-            _ => Ok(Written::Nothing),
+            _ => {}
         }
+
+        let Some(response) = self.autodetect.process_request(&request, received_at) else {
+            return Ok(Written::Nothing);
+        };
+        let response = AutoDetectRspPdu::new(response);
+        let written = encode_send_data_request(user_channel_id, message_channel_id, &response, output)?;
+        Written::from_size(written)
     }
+}
+
+/// Recognizes a Server Auto-Detect Request PDU ([MS-RDPBCGR] 2.2.14.3) on the MCS message channel.
+///
+/// Returns `None` when `input` is anything else, so the caller hands it to its own decoder as
+/// before. Returns `Some(Err(_))` for a PDU that carries `SEC_AUTODETECT_REQ` on the message channel
+/// but whose auto-detect data does not decode: it is still not a PDU of the phase the caller is in,
+/// so the caller skips it rather than failing on it.
+///
+/// The server may send these outside the Optional Connect-Time Auto-Detection phase, while licensing,
+/// capabilities exchange or connection finalization is still in progress, and Windows RDS hosts do.
+/// Those phases decode whatever arrives as their own PDU, so without this check an advisory probe
+/// ends the connection.
+pub(crate) fn decode_message_channel_autodetect(
+    input: &[u8],
+    message_channel_id: u16,
+) -> Option<DecodeResult<rdp::autodetect::AutoDetectRequest>> {
+    let ctx = mcs::decode_send_data_indication(input).ok()?;
+    if ctx.channel_id != message_channel_id {
+        return None;
+    }
+
+    let mut cursor = ReadCursor::new(ctx.user_data);
+    let security_header = rdp::headers::BasicSecurityHeader::decode(&mut cursor).ok()?;
+    // SEC_RESET_SEQNO and SEC_IGNORE_SEQNO MUST be ignored ([MS-RDPBCGR] 2.2.8.1.1.2.1).
+    let flags = security_header.flags.difference(
+        rdp::headers::BasicSecurityHeaderFlags::RESET_SEQNO | rdp::headers::BasicSecurityHeaderFlags::IGNORE_SEQNO,
+    );
+    if flags != rdp::headers::BasicSecurityHeaderFlags::AUTODETECT_REQ {
+        return None;
+    }
+
+    Some(decode::<rdp::autodetect::AutoDetectReqPdu>(ctx.user_data).map(|pdu| pdu.request))
 }
 
 /// Build an Initiate Multitransport Response carrying `hr_response`.
@@ -1084,6 +930,47 @@ impl Sequence for ClientConnector {
         received_at: Option<MonotonicInstant>,
         output: &mut WriteBuf,
     ) -> ConnectorResult<Written> {
+        // Auto-Detect Requests that arrive after the connect-time phase has ended, while one of the
+        // later phases is waiting for its own PDU, are answered here and the phase keeps waiting.
+        // The responder is the connect-time one, so an RTT request is answered and a connect-time
+        // bandwidth measurement is timed as it would be in that phase; see
+        // `decode_message_channel_autodetect` for why these arrive at all.
+        if let Some(message_channel_id) = self.message_channel_id {
+            let user_channel_id = match &self.state {
+                ClientConnectorState::LicensingExchange { user_channel_id, .. }
+                | ClientConnectorState::MultitransportBootstrapping { user_channel_id, .. } => Some(*user_channel_id),
+                ClientConnectorState::CapabilitiesExchange { connection_activation }
+                | ClientConnectorState::ConnectionFinalization { connection_activation } => {
+                    Some(connection_activation.user_channel_id())
+                }
+                _ => None,
+            };
+
+            if let Some(user_channel_id) = user_channel_id.filter(|_| self.next_pdu_hint().is_some()) {
+                match decode_message_channel_autodetect(input, message_channel_id) {
+                    Some(Ok(request)) => {
+                        debug!(
+                            state = self.state.name(),
+                            ?request,
+                            "Auto-Detect Request outside its phase"
+                        );
+                        return self.respond_to_connect_time_autodetect(
+                            request,
+                            received_at,
+                            message_channel_id,
+                            user_channel_id,
+                            output,
+                        );
+                    }
+                    Some(Err(error)) => {
+                        debug!(state = self.state.name(), %error, "Skipping an undecodable Auto-Detect Request");
+                        return Ok(Written::Nothing);
+                    }
+                    None => {}
+                }
+            }
+        }
+
         let (written, next_state) = match mem::take(&mut self.state) {
             // Invalid state
             ClientConnectorState::Consumed => {
@@ -1317,7 +1204,6 @@ impl Sequence for ClientConnector {
             }
 
             //== Optional Connect-Time Auto-Detection ==//
-            // NOTE: IronRDP is not expecting the Auto-Detect Request PDU from server.
             ClientConnectorState::ConnectTimeAutoDetection {
                 io_channel_id,
                 user_channel_id,
@@ -1497,7 +1383,8 @@ impl Sequence for ClientConnector {
                     // Demand Active: bootstrapping is over, hand off to capabilities
                     // exchange with the PDU intact.
                     let mut connection_activation =
-                        ConnectionActivationSequence::new(self.config.clone(), io_channel_id, user_channel_id);
+                        ConnectionActivationSequence::new(self.config.clone(), io_channel_id, user_channel_id)
+                            .with_message_channel_id(message_channel_id);
                     let written = connection_activation.step(input, received_at, output)?;
 
                     (
@@ -1601,6 +1488,7 @@ impl Sequence for ClientConnector {
                                         connection_activation.io_channel_id(),
                                         connection_activation.user_channel_id(),
                                     )
+                                    .with_message_channel_id(self.message_channel_id)
                                     .with_multitransport_soft_sync(self.soft_sync_negotiated()),
                                     compression_type: self.config.compression_type,
                                 },

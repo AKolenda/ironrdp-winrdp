@@ -118,6 +118,7 @@ ironrdp = { version = "0.17", features = ["connector", "session", "graphics"] }
 ```
 
 Each feature maps to a standalone crate, so you can depend on `ironrdp-pdu`, `ironrdp-connector`, `ironrdp-session`, and related crates directly.
+The shared `ironrdp-autodetect` state machine handles client network measurements during connection establishment, reactivation, and active sessions.
 API documentation is available on [docs.rs].
 
 Two runnable examples ship with the meta crate:
