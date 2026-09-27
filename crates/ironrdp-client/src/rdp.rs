@@ -2856,6 +2856,30 @@ enum RdpControlFlow {
     TerminatedGracefully(GracefulDisconnectReason),
 }
 
+fn frame_read_failure(error: io::Error, graceful_shutdown_sent: bool) -> SessionResult<RdpControlFlow> {
+    let transport_error = is_transport_read_error(&error);
+    // A server may acknowledge our shutdown request by closing the transport instead of
+    // sending a Disconnect Provider Ultimatum. An unsolicited close is still a failure.
+    if graceful_shutdown_sent
+        && transport_error
+        && matches!(
+            error.kind(),
+            io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+        )
+    {
+        return Ok(RdpControlFlow::TerminatedGracefully(
+            GracefulDisconnectReason::UserInitiated,
+        ));
+    }
+
+    let error = ironrdp_session::custom_err!("read frame", error);
+    if transport_error {
+        Ok(RdpControlFlow::TransportFailure(error))
+    } else {
+        Err(error)
+    }
+}
+
 /// Per-second session performance counters, logged at INFO as `session perf` so
 /// transports (TCP vs reliable UDP) can be compared from the log alone.
 ///
@@ -3247,12 +3271,7 @@ async fn active_session(
                 frame = reader.read_pdu() => {
                     let (action, payload) = match frame {
                         Ok(frame) => frame,
-                        Err(error) if is_transport_read_error(&error) => {
-                            return Ok(RdpControlFlow::TransportFailure(
-                                ironrdp_session::custom_err!("read frame", error),
-                            ));
-                        }
-                        Err(error) => return Err(ironrdp_session::custom_err!("read frame", error)),
+                        Err(error) => return frame_read_failure(error, graceful_shutdown_sent),
                     };
                     trace!(?action, frame_length = payload.len(), "Frame received");
                     let processing_started = Instant::now();
@@ -3506,7 +3525,11 @@ async fn active_session(
                             None => ActiveSessionIteration::outputs(Vec::new()),
                         }
                     }
-                    RdpInputEvent::Close => ActiveSessionIteration::outputs(active_stage.graceful_shutdown()?),
+                    RdpInputEvent::Close => {
+                        let outputs = active_stage.graceful_shutdown()?;
+                        graceful_shutdown_sent = true;
+                        ActiveSessionIteration::outputs(outputs)
+                    }
                     #[cfg(feature = "clipboard")]
                     RdpInputEvent::Clipboard(event) => {
                         ActiveSessionIteration::outputs(process_clipboard_message(&mut active_stage, event)?)
@@ -4852,6 +4875,47 @@ mod tests {
             ironrdp_connector::custom_err!("read frame", protocol_error)
         );
         assert!(!is_transport_session_error(&protocol_error));
+    }
+
+    #[test]
+    fn transport_closure_requires_a_local_shutdown_request_to_be_graceful() {
+        for kind in [
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+        ] {
+            assert!(matches!(
+                frame_read_failure(io::Error::from(kind), false),
+                Ok(RdpControlFlow::TransportFailure(_))
+            ));
+            assert!(matches!(
+                frame_read_failure(io::Error::from(kind), true),
+                Ok(RdpControlFlow::TerminatedGracefully(
+                    GracefulDisconnectReason::UserInitiated
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn local_shutdown_does_not_hide_unrelated_read_errors() {
+        for kind in [
+            io::ErrorKind::Other,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::InvalidData,
+        ] {
+            assert!(matches!(
+                frame_read_failure(io::Error::from(kind), true),
+                Ok(RdpControlFlow::TransportFailure(_))
+            ));
+        }
+
+        for graceful_shutdown_sent in [false, true] {
+            let decode_error = ironrdp_pdu::find_size(&[0x01]).expect_err("invalid fast-path action must fail");
+            // The error source takes precedence even if a transport labels it as EOF.
+            let protocol_error = io::Error::new(io::ErrorKind::UnexpectedEof, decode_error);
+            assert!(frame_read_failure(protocol_error, graceful_shutdown_sent).is_err());
+        }
     }
 
     #[test]
