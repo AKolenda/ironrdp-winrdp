@@ -816,13 +816,13 @@ impl RdpeudpConnection {
         }
 
         // Standalone ACK
-        if self.ack_pending {
-            if let Some(transmit) = self.build_standalone_ack(now) {
-                self.ack_pending = false;
-                self.timers.clear(Timer::AckDelay);
-                self.timers.set(Timer::KeepAlive, now + self.config.keep_alive_interval);
-                return Some(transmit);
-            }
+        if self.ack_pending
+            && let Some(transmit) = self.build_standalone_ack(now)
+        {
+            self.ack_pending = false;
+            self.timers.clear(Timer::AckDelay);
+            self.timers.set(Timer::KeepAlive, now + self.config.keep_alive_interval);
+            return Some(transmit);
         }
 
         None
@@ -992,10 +992,9 @@ impl RdpeudpConnection {
             wire: WireFormat::V1 { version },
             ..
         }) = self.params.as_ref()
+            && *version < 2
         {
-            if *version < 2 {
-                return CEILING;
-            }
+            return CEILING;
         }
 
         match self.rtt.srtt() {
@@ -2172,10 +2171,10 @@ impl RdpeudpConnection {
                     if floor.is_none_or(|floor| source_seq < floor) {
                         break 'elements;
                     }
-                    if element.state.is_received() {
-                        if let Some(entry) = pending.get(&source_seq) {
-                            acked.push(*entry);
-                        }
+                    if element.state.is_received()
+                        && let Some(entry) = pending.get(&source_seq)
+                    {
+                        acked.push(*entry);
                     }
                     current = source_seq.checked_sub(1);
                 }

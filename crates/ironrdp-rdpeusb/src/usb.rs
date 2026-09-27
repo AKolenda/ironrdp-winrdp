@@ -347,13 +347,13 @@ pub fn get_interface_completion(completion: CompletionData) -> Result<UsbResult<
 /// owning state layer instead of this function.
 pub fn control_transfer(setup: SetupPacket, data: Vec<u8>) -> Result<TransferRequest, ConversionError> {
     validate_control_data(setup, &data)?;
-    if let Some(request) = setup.standard_request() {
-        if matches!(
+    if let Some(request) = setup.standard_request()
+        && matches!(
             request,
             standard_request::SET_ADDRESS | standard_request::SET_CONFIGURATION | standard_request::SET_INTERFACE
-        ) {
-            return Err(ConversionError::StatefulStandardRequest { request });
-        }
+        )
+    {
+        return Err(ConversionError::StatefulStandardRequest { request });
     }
 
     let data = if setup.request_type.kind() == RequestKind::STANDARD {

@@ -160,15 +160,13 @@ async fn run_proxy(mut out: DuplexStream, mut input: DuplexStream, scenario: Moc
                         }
                     }
                     TSPROXY_CREATE_CHANNEL_OPNUM => {
-                        if message_before_create_channel {
-                            if let (Some(message), Some(call_id)) = (message.take(), tunnel_message_call_id) {
-                                if write_response(&mut out, call_id, &tunnel_message_response(message))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
+                        if message_before_create_channel
+                            && let (Some(message), Some(call_id)) = (message.take(), tunnel_message_call_id)
+                            && write_response(&mut out, call_id, &tunnel_message_response(message))
+                                .await
+                                .is_err()
+                        {
+                            return;
                         }
                         if write_response(&mut out, request_call_id, &create_channel_response(&CHANNEL_CONTEXT, 3))
                             .await

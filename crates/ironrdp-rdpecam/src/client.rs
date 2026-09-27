@@ -396,10 +396,10 @@ where
         if self.activation_depth == u32::MAX {
             return DevicePdu::ErrorResponse(ErrorCode::InvalidRequest);
         }
-        if self.activation_depth == 0 {
-            if let Err(error) = self.backend.activate() {
-                return DevicePdu::ErrorResponse(error);
-            }
+        if self.activation_depth == 0
+            && let Err(error) = self.backend.activate()
+        {
+            return DevicePdu::ErrorResponse(error);
         }
         self.activation_depth += 1;
         DevicePdu::SuccessResponse
@@ -412,10 +412,10 @@ where
             }
             self.streaming = None;
         }
-        if self.activation_depth == 1 {
-            if let Err(error) = self.backend.deactivate() {
-                return DevicePdu::ErrorResponse(error);
-            }
+        if self.activation_depth == 1
+            && let Err(error) = self.backend.deactivate()
+        {
+            return DevicePdu::ErrorResponse(error);
         }
         self.activation_depth -= 1;
         DevicePdu::SuccessResponse

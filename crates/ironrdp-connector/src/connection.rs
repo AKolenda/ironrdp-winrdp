@@ -10,7 +10,7 @@ use ironrdp_pdu::rdp::capability_sets::WindowSupportLevel;
 use ironrdp_pdu::rdp::session_info::ServerAutoReconnect;
 use ironrdp_pdu::x224::X224;
 use ironrdp_pdu::{PduHint, gcc, mcs, nego, rdp};
-use ironrdp_svc::{MAX_STATIC_CHANNELS, StaticChannelKey, StaticChannelSet, StaticVirtualChannel, SvcClientProcessor};
+use ironrdp_svc::{MAX_STATIC_CHANNELS, StaticChannelKey, StaticChannelSet, SvcClientProcessor};
 use tracing::{debug, error, info, warn};
 
 use crate::channel_connection::{ChannelConnectionSequence, ChannelConnectionState};
@@ -1065,7 +1065,7 @@ impl Sequence for ClientConnector {
                     selected_protocol,
                     self.response_flags
                         .contains(nego::ResponseFlags::EXTENDED_CLIENT_DATA_SUPPORTED),
-                    self.static_channels.values(),
+                    &self.static_channels,
                 )?;
 
                 let connect_initial =
@@ -1531,13 +1531,12 @@ pub fn encode_send_data_request<T: Encode>(
     Ok(written)
 }
 
-#[expect(single_use_lifetimes)] // anonymous lifetimes in `impl Trait` are unstable
-fn create_gcc_blocks<'a>(
+fn create_gcc_blocks(
     config: &Config,
     cluster_data: Option<&gcc::ClientClusterData>,
     selected_protocol: nego::SecurityProtocol,
     extended_client_data_supported: bool,
-    static_channels: impl Iterator<Item = &'a StaticVirtualChannel>,
+    static_channels: &StaticChannelSet,
 ) -> ConnectorResult<gcc::ClientGccBlocks> {
     use ironrdp_pdu::gcc::{
         ClientCoreData, ClientCoreOptionalData, ClientEarlyCapabilityFlags, ClientGccBlocks, ClientNetworkData,
@@ -1570,6 +1569,7 @@ fn create_gcc_blocks<'a>(
         | SupportedColorDepths::BPP15;
 
     let channels = static_channels
+        .values()
         .map(ironrdp_svc::make_channel_definition)
         .collect::<Vec<_>>();
 
@@ -1773,7 +1773,7 @@ mod tests {
     use ironrdp_pdu::rdp::client_info::ClientInfoFlags;
     use ironrdp_pdu::{gcc, nego};
 
-    use super::{create_client_info_pdu, create_gcc_blocks};
+    use super::{StaticChannelSet, create_client_info_pdu, create_gcc_blocks};
     use crate::{Config, Credentials, DesktopSize};
 
     #[test]
@@ -1950,7 +1950,7 @@ mod tests {
             None,
             nego::SecurityProtocol::empty(),
             true,
-            core::iter::empty(),
+            &StaticChannelSet::new(),
         )
         .expect("valid GCC Client Monitor Data");
 
@@ -1970,7 +1970,7 @@ mod tests {
             None,
             nego::SecurityProtocol::empty(),
             true,
-            core::iter::empty(),
+            &StaticChannelSet::new(),
         )
         .expect("valid GCC Client Monitor Data");
 
@@ -1989,7 +1989,7 @@ mod tests {
             None,
             nego::SecurityProtocol::empty(),
             false,
-            core::iter::empty(),
+            &StaticChannelSet::new(),
         )
         .expect("valid GCC Client Monitor Data");
 
@@ -2015,7 +2015,7 @@ mod tests {
             Some(&cluster_data),
             nego::SecurityProtocol::empty(),
             true,
-            core::iter::empty(),
+            &StaticChannelSet::new(),
         )
         .expect("valid GCC Client Cluster Data");
         assert_eq!(blocks.cluster, Some(cluster_data));

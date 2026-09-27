@@ -888,10 +888,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     return Err(error);
                 }
             };
-            if let Some(exit_code) = exit_code {
-                if exit_code != 0 {
-                    std::process::exit(remote_exit_status(exit_code));
-                }
+            if let Some(exit_code) = exit_code
+                && exit_code != 0
+            {
+                std::process::exit(remote_exit_status(exit_code));
             }
             return Ok(());
         }

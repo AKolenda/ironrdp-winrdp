@@ -154,10 +154,11 @@ pub fn read_capture(path: &Path) -> Result<Capture, ReplayError> {
                         packet += 1;
                         let interface = usize::try_from(packet_block.if_id)
                             .map_err(|_| ReplayError::Pcap("interface ID is too large".to_owned()))?;
-                        if linktypes.get(interface) == Some(&ETHERNET_LINKTYPE) && !packet_block.truncated() {
-                            if let Some(segment) = parse_tcp_packet(packet, packet_block.packet_data()) {
-                                segments.push(segment);
-                            }
+                        if linktypes.get(interface) == Some(&ETHERNET_LINKTYPE)
+                            && !packet_block.truncated()
+                            && let Some(segment) = parse_tcp_packet(packet, packet_block.packet_data())
+                        {
+                            segments.push(segment);
                         }
                     }
                     _ => {}

@@ -115,11 +115,10 @@ impl<C: OsClipboard, P: ClipboardMessageProxy> Worker<C, P> {
         if self
             .pending
             .is_some_and(|(_, since)| since.elapsed() >= PENDING_PASTE_TIMEOUT)
+            && let Some(next) = self.desired.take()
         {
-            if let Some(next) = self.desired.take() {
-                debug!("Pending paste timed out; requesting the newer remote copy");
-                self.issue_paste(next);
-            }
+            debug!("Pending paste timed out; requesting the newer remote copy");
+            self.issue_paste(next);
         }
         let Some(content) = self.os.read() else {
             return;

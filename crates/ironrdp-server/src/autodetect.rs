@@ -233,10 +233,10 @@ impl AutoDetectManager {
         let base_rtt_ms = self.min_rtt_ms?;
         let snapshot = self.snapshot()?;
 
-        if let Some(last) = self.last_netchar_result_ms {
-            if now_ms.saturating_sub(last) < NETCHAR_RESULT_MIN_INTERVAL_MS {
-                return None;
-            }
+        if let Some(last) = self.last_netchar_result_ms
+            && now_ms.saturating_sub(last) < NETCHAR_RESULT_MIN_INTERVAL_MS
+        {
+            return None;
         }
         self.last_netchar_result_ms = Some(now_ms);
         self.rtt_is_fresh = false;

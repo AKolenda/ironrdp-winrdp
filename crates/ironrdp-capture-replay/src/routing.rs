@@ -185,10 +185,10 @@ impl ReplayRouter {
         if ids.len() != 2 {
             return Err(ReplayError::ContradictoryRoutingState);
         }
-        if let Some(message_channel_id) = state.message_channel_id {
-            if !ids.insert(message_channel_id) {
-                return Err(ReplayError::ContradictoryRoutingState);
-            }
+        if let Some(message_channel_id) = state.message_channel_id
+            && !ids.insert(message_channel_id)
+        {
+            return Err(ReplayError::ContradictoryRoutingState);
         }
         let mut channels = StaticChannelSet::new();
         let mut drdynvc_channel_id = None;
@@ -324,15 +324,16 @@ impl ReplayRouter {
                 route,
             });
         }
-        if !activated && (activation_packet.is_some() || !ever_activated) {
-            if let Some(packet) = activation_packet.or(first_server_packet) {
-                report.gaps.push(ReplayGap {
-                    packet,
-                    direction: ReplayDirection::Server,
-                    kind: ReplayGapKind::IncompleteActivation,
-                    skipped_bytes: 0,
-                });
-            }
+        if !activated
+            && (activation_packet.is_some() || !ever_activated)
+            && let Some(packet) = activation_packet.or(first_server_packet)
+        {
+            report.gaps.push(ReplayGap {
+                packet,
+                direction: ReplayDirection::Server,
+                kind: ReplayGapKind::IncompleteActivation,
+                skipped_bytes: 0,
+            });
         }
         report.gaps.sort_by_key(|gap| gap.packet);
         Ok(report)
@@ -511,16 +512,16 @@ impl ReplayRouter {
                 continue;
             };
 
-            if let Some((width, height)) = reset {
-                if !self.egfx_framebuffer.reset(width, height) {
-                    report.gaps.push(ReplayGap {
-                        packet,
-                        direction: ReplayDirection::Server,
-                        kind: ReplayGapKind::Unsupported,
-                        skipped_bytes: 0,
-                    });
-                    continue;
-                }
+            if let Some((width, height)) = reset
+                && !self.egfx_framebuffer.reset(width, height)
+            {
+                report.gaps.push(ReplayGap {
+                    packet,
+                    direction: ReplayDirection::Server,
+                    kind: ReplayGapKind::Unsupported,
+                    skipped_bytes: 0,
+                });
+                continue;
             }
             let mut has_output = false;
             for update in &output {

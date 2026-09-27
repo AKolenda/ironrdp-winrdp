@@ -81,13 +81,13 @@ pub fn export_capture(capture: &Capture, options: &ExportOptions) -> Result<Expo
     match result {
         Ok(summary) => Ok(summary),
         Err(error) => {
-            if !output.finalization_started {
-                if let Err(cleanup_error) = fs::remove_dir_all(&output.directory) {
-                    return Err(ExportError::CleanupOutput {
-                        original_error: Box::new(error),
-                        cleanup_error,
-                    });
-                }
+            if !output.finalization_started
+                && let Err(cleanup_error) = fs::remove_dir_all(&output.directory)
+            {
+                return Err(ExportError::CleanupOutput {
+                    original_error: Box::new(error),
+                    cleanup_error,
+                });
             }
             Err(error)
         }

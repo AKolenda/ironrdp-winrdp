@@ -176,10 +176,11 @@ pub mod ffi {
 
         /// Gets the server address string (for Response variant)
         pub fn get_server_addr<'a>(&'a self, writeable: &'a mut DiplomatWriteable) {
-            if self.0.server_addr.is_some() && self.0.server_cert_chain.is_some() {
-                if let Some(server_addr) = &self.0.server_addr {
-                    let _ = write!(writeable, "{server_addr}");
-                }
+            if self.0.server_addr.is_some()
+                && self.0.server_cert_chain.is_some()
+                && let Some(server_addr) = &self.0.server_addr
+            {
+                let _ = write!(writeable, "{server_addr}");
             }
         }
 

@@ -286,10 +286,8 @@ fn request_pdus(bytes: &[u8], packet_offsets: &[(usize, usize)], body_start: usi
                 });
             }
         }
-        if last {
-            if let Some(pdu) = pending.take() {
-                complete.push(pdu);
-            }
+        if last && let Some(pdu) = pending.take() {
+            complete.push(pdu);
         }
     }
     Ok(complete)

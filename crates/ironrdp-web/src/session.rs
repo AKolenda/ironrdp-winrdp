@@ -1849,14 +1849,13 @@ where
                 if let Ok(x224_confirm) = ironrdp_core::decode::<
                     ironrdp::pdu::x224::X224<ironrdp::pdu::nego::ConnectionConfirm>,
                 >(&x224_connection_response)
+                    && let ironrdp::pdu::nego::ConnectionConfirm::Failure { code } = x224_confirm.0
                 {
-                    if let ironrdp::pdu::nego::ConnectionConfirm::Failure { code } = x224_confirm.0 {
-                        let negotiation_failure = connector::NegotiationFailure::from(code);
-                        return Err(IronError::from(
-                            anyhow::Error::new(negotiation_failure).context("RDP negotiation failed"),
-                        )
-                        .with_kind(IronErrorKind::NegotiationFailure));
-                    }
+                    let negotiation_failure = connector::NegotiationFailure::from(code);
+                    return Err(IronError::from(
+                        anyhow::Error::new(negotiation_failure).context("RDP negotiation failed"),
+                    )
+                    .with_kind(IronErrorKind::NegotiationFailure));
                 }
 
                 return Err(

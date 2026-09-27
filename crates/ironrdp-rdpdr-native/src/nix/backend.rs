@@ -711,16 +711,16 @@ pub(crate) fn query_directory(
                     true,
                 )
             } else {
-                if let Some(dirp_iter) = backend.file_dir_map.get_mut(&req_inner.device_io_request.file_id) {
-                    if let Some(Ok(next)) = dirp_iter.next() {
-                        let file_name = next.file_name();
-                        let mut full_path = parent_pos_for_next.clone();
-                        if !full_path.ends_with('/') {
-                            full_path.push('/');
-                        }
-                        full_path.push_str(file_name.to_string_lossy().into_owned().as_str());
-                        find_file_name = Some(full_path);
+                if let Some(dirp_iter) = backend.file_dir_map.get_mut(&req_inner.device_io_request.file_id)
+                    && let Some(Ok(next)) = dirp_iter.next()
+                {
+                    let file_name = next.file_name();
+                    let mut full_path = parent_pos_for_next.clone();
+                    if !full_path.ends_with('/') {
+                        full_path.push('/');
                     }
+                    full_path.push_str(file_name.to_string_lossy().into_owned().as_str());
+                    find_file_name = Some(full_path);
                 }
                 make_query_dir_resp(
                     find_file_name,

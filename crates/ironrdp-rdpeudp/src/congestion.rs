@@ -128,11 +128,11 @@ impl CongestionControl {
     ///
     /// Returns `true` if the window was actually reduced.
     pub(crate) fn on_loss(&mut self, loss_seq: u64, largest_sent: u64) -> bool {
-        if let Some(recovery) = self.recovery_seq {
-            if loss_seq <= recovery {
-                // Same congestion event: already reacted.
-                return false;
-            }
+        if let Some(recovery) = self.recovery_seq
+            && loss_seq <= recovery
+        {
+            // Same congestion event: already reacted.
+            return false;
         }
 
         self.recovery_seq = Some(largest_sent);

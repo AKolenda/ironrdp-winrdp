@@ -370,10 +370,10 @@ impl Processor {
                 // Surface the auto-reconnect cookie alongside the logon status so
                 // the consumer can keep it for a later reconnect. Both come out of
                 // this one PDU and neither supersedes the other.
-                if let InfoData::LogonExtended(extended) = &session_info.info_data {
-                    if let Some(cookie) = &extended.auto_reconnect {
-                        outputs.push(ProcessorOutput::AutoReconnectCookie(cookie.clone()));
-                    }
+                if let InfoData::LogonExtended(extended) = &session_info.info_data
+                    && let Some(cookie) = &extended.auto_reconnect
+                {
+                    outputs.push(ProcessorOutput::AutoReconnectCookie(cookie.clone()));
                 }
 
                 Ok(outputs)

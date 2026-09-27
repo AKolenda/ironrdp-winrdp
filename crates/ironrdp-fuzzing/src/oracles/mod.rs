@@ -998,13 +998,11 @@ pub fn rdpeudp_connection(data: &[u8]) {
         // check is only meaningful right after a clock advance, because
         // between advances a timer legitimately stays due until the driver
         // gets to it.
-        if advanced {
-            if let Some(deadline) = conn.poll_timeout() {
-                assert!(
-                    deadline > now,
-                    "handle_timeout left a timer due at {deadline:?} with now={now:?}, which spins the driver"
-                );
-            }
+        if advanced && let Some(deadline) = conn.poll_timeout() {
+            assert!(
+                deadline > now,
+                "handle_timeout left a timer due at {deadline:?} with now={now:?}, which spins the driver"
+            );
         }
     }
 }

@@ -167,10 +167,10 @@ fn validate_title(title: &str) -> Result<(&str, bool), String> {
         {
             return Err("`test` titles may use only the `core` or `extra` scope".into());
         }
-    } else if let Some(scope) = scope {
-        if !CANONICAL_SCOPES.contains(&scope) {
-            return Err(format!("unsupported title scope `{scope}`"));
-        }
+    } else if let Some(scope) = scope
+        && !CANONICAL_SCOPES.contains(&scope)
+    {
+        return Err(format!("unsupported title scope `{scope}`"));
     }
 
     Ok((commit_type, breaking))

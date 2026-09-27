@@ -782,10 +782,10 @@ fn no_proxy_matches(host: &str, port: u16, no_proxy: &str) -> bool {
 }
 
 fn split_no_proxy_port(entry: &str) -> (&str, Option<u16>) {
-    if let Some(entry) = entry.strip_prefix('[') {
-        if let Some((host, port)) = entry.split_once("]:") {
-            return (host, port.parse().ok());
-        }
+    if let Some(entry) = entry.strip_prefix('[')
+        && let Some((host, port)) = entry.split_once("]:")
+    {
+        return (host, port.parse().ok());
     }
     if entry.parse::<IpAddr>().is_ok() {
         return (entry, None);

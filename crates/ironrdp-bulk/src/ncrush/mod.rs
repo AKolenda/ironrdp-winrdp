@@ -1251,7 +1251,6 @@ impl NCrushContext {
 
         // Process all bytes except the last 2 (match needs at least 2 bytes ahead)
         while src_pos < src_size.saturating_sub(2) {
-            let mut match_length: usize = 0;
             let ho = history_ptr;
 
             if ho > history_ptr_limit {
@@ -1266,13 +1265,11 @@ impl NCrushContext {
             }
 
             // Try to find a match via the hash chain
-            let mut match_offset: u16 = 0;
-            if self.match_table[ho] != 0 {
-                if let Some((mlen, moff)) = self.find_best_match(ho as u16)? {
-                    match_length = mlen;
-                    match_offset = moff;
-                }
-            }
+            let (mut match_length, match_offset) = if self.match_table[ho] != 0 {
+                self.find_best_match(ho as u16)?.unwrap_or_default()
+            } else {
+                (0, 0)
+            };
 
             // Compute CopyOffset if we found a match
             let copy_offset = if match_length > 0 {

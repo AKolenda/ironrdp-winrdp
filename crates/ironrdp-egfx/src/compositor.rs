@@ -572,10 +572,11 @@ impl Compositor {
         // deferral addresses: a PDU naming the same rectangle 65,535 times collapses
         // to a single entry. Comparing against only the previous entry keeps this
         // O(1); it is a repeat filter, not region coalescing.
-        if let Some(last) = self.frame.last() {
-            if last.surface_id == surface_id && covers(&last.rect, &rect) {
-                return;
-            }
+        if let Some(last) = self.frame.last()
+            && last.surface_id == surface_id
+            && covers(&last.rect, &rect)
+        {
+            return;
         }
 
         // The filter above only collapses consecutive repeats, so alternating

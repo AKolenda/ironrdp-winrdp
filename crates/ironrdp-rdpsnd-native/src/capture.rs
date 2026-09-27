@@ -393,10 +393,10 @@ fn push_i16_samples(sink_state: &Arc<Mutex<Option<SinkState>>>, samples: &[i16])
         sink(packet);
     }
 
-    if let Ok(mut guard) = sink_state.lock() {
-        if let Some(state) = guard.as_mut() {
-            state.sink = sink;
-        }
+    if let Ok(mut guard) = sink_state.lock()
+        && let Some(state) = guard.as_mut()
+    {
+        state.sink = sink;
     }
 }
 
@@ -421,9 +421,9 @@ fn push_f32_samples(sink_state: &Arc<Mutex<Option<SinkState>>>, samples: &[f32])
         sink(packet);
     }
 
-    if let Ok(mut guard) = sink_state.lock() {
-        if let Some(state) = guard.as_mut() {
-            state.sink = sink;
-        }
+    if let Ok(mut guard) = sink_state.lock()
+        && let Some(state) = guard.as_mut()
+    {
+        state.sink = sink;
     }
 }

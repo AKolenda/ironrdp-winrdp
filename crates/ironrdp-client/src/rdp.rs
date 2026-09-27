@@ -2747,14 +2747,13 @@ where
                 if let Ok(x224_confirm) = ironrdp_core::decode::<
                     ironrdp_pdu::x224::X224<ironrdp_pdu::nego::ConnectionConfirm>,
                 >(&x224_connection_response)
+                    && let ironrdp_pdu::nego::ConnectionConfirm::Failure { code } = x224_confirm.0
                 {
-                    if let ironrdp_pdu::nego::ConnectionConfirm::Failure { code } = x224_confirm.0 {
-                        let negotiation_failure = ironrdp_connector::NegotiationFailure::from(code);
-                        return Err(ironrdp_connector::ConnectorError::new(
-                            "RDP negotiation failed",
-                            ironrdp_connector::ConnectorErrorKind::Negotiation(negotiation_failure),
-                        ));
-                    }
+                    let negotiation_failure = ironrdp_connector::NegotiationFailure::from(code);
+                    return Err(ironrdp_connector::ConnectorError::new(
+                        "RDP negotiation failed",
+                        ironrdp_connector::ConnectorErrorKind::Negotiation(negotiation_failure),
+                    ));
                 }
                 return Err(ironrdp_connector::general_err!(
                     "received RDCleanPath negotiation error"
@@ -3808,12 +3807,12 @@ async fn active_session(
         let udp_version = udp_tunnel.transport.as_ref().and_then(|t| t.negotiated_version());
         #[cfg(not(feature = "udp"))]
         let udp_version = None;
-        if let Some(event) = perf.transport_event_if_changed(&active_stage, udp_version) {
-            if !send_active_output_event(output_event_sender, event, close_receiver).await? {
-                return Ok(RdpControlFlow::TerminatedGracefully(
-                    GracefulDisconnectReason::UserInitiated,
-                ));
-            }
+        if let Some(event) = perf.transport_event_if_changed(&active_stage, udp_version)
+            && !send_active_output_event(output_event_sender, event, close_receiver).await?
+        {
+            return Ok(RdpControlFlow::TerminatedGracefully(
+                GracefulDisconnectReason::UserInitiated,
+            ));
         }
 
         if let Some(batch) = iteration.dvc_batch {
