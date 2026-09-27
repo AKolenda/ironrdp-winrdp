@@ -15,9 +15,18 @@ After Soft-Sync migrates a channel, sideband loss ends the connection so automat
 Gateway, RDCleanPath, named-pipe, Hyper-V VM Connect, and standard RDP security transports are TCP-only; `prefer_direct` may use UDP only for its direct attempt.
 Legacy RDP-UDP v1/v2 data transfer and lossy RDP-UDP-L are not supported.
 
-The library is winit-agnostic. Output events are emitted on a bounded
-`tokio::sync::mpsc::Sender<RdpOutputEvent>` channel: the embedder is responsible
-for consuming them and dispatching them to whatever event loop or runtime it wishes.
+The library is winit-agnostic. `output_channel` carries control events in a bounded
+queue and coalesces display updates. The embedder forwards these events to its own
+event loop or runtime.
+
+By default, `RdpOutputEvent::Image` supplies a complete `0x00RRGGBB` framebuffer.
+Hosts that repaint only changed regions can pass a `SharedFramebuffer` to
+`RdpClient::with_shared_framebuffer`. The client converts each graphics update in
+place and sends `FramebufferUpdated` when damage first becomes pending. Under the
+framebuffer lock, the host takes the accumulated rectangle with `take_dirty` and
+copies the corresponding pixels. Updates received before that copy are merged,
+so coalescing notifications does not lose changed regions. Release the lock before
+presenting the window; the session needs it to apply subsequent updates.
 
 TLS peer-certificate validation remains disabled by default for compatibility with
 existing deployments. `ConfigBuilder` exposes an explicit

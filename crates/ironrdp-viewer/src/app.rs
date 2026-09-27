@@ -509,6 +509,8 @@ impl RpcApp {
 
                 window.request_redraw();
             }
+            // Only sent to a host that supplies a shared framebuffer, which this viewer does not.
+            RdpOutputEvent::FramebufferUpdated => {}
             RdpOutputEvent::ConnectionFailure(error) => {
                 error!(?error);
                 eprintln!("Connection error: {}", error.report().with_locations());

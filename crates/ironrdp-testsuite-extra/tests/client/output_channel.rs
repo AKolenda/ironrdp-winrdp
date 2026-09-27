@@ -27,6 +27,7 @@ fn image_event(width: u16) -> RdpOutputEvent {
 #[test]
 fn drop_policy_classification() {
     assert_eq!(image_event(1).drop_policy(), DropPolicy::LatestOnly);
+    assert_eq!(RdpOutputEvent::FramebufferUpdated.drop_policy(), DropPolicy::LatestOnly);
     assert_eq!(RdpOutputEvent::PointerDefault.drop_policy(), DropPolicy::LatestOnly);
     assert_eq!(RdpOutputEvent::PointerHidden.drop_policy(), DropPolicy::LatestOnly);
     assert_eq!(
@@ -54,6 +55,23 @@ async fn latest_only_send_never_blocks_and_drops_stale_values() {
         panic!("expected Image");
     };
     assert_eq!(width.get(), 50, "receiver must observe only the newest Image");
+}
+
+#[tokio::test]
+async fn framebuffer_notifications_coalesce_and_drain_when_the_sender_closes() {
+    let (sender, mut receiver) = output_channel(1);
+    sender.try_send(RdpOutputEvent::Connected).unwrap();
+    for _ in 0..50 {
+        sender.try_send(RdpOutputEvent::FramebufferUpdated).unwrap();
+    }
+    drop(sender);
+
+    assert!(matches!(receiver.recv().await, Some(RdpOutputEvent::Connected)));
+    assert!(matches!(
+        receiver.recv().await,
+        Some(RdpOutputEvent::FramebufferUpdated)
+    ));
+    assert!(receiver.recv().await.is_none());
 }
 
 /// Different `LatestOnly` variants occupy independent slots: a burst of Image

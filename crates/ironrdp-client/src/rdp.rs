@@ -80,6 +80,7 @@ use ironrdp_rdpewa_native::{WindowsRdpewaBackend, WindowsRdpewaSessionState};
 use ironrdp_rdpsnd_native::{RdpeaiCaptureBackend, cpal};
 
 use crate::config::{Config, RDCleanPathConfig, Transport};
+use crate::framebuffer::SharedFramebuffer;
 use crate::rail::{RailClient, RailControlEvent, RailEvent, RailInputEvent};
 use ironrdp_rail::pdu::{ExecutePdu, ExecuteResultPdu};
 
@@ -124,6 +125,13 @@ pub enum RdpOutputEvent {
         width: NonZeroU16,
         height: NonZeroU16,
     },
+    /// The shared framebuffer has areas to repaint; replaces `Image` when the host supplied
+    /// one with [`RdpClient::with_shared_framebuffer`].
+    ///
+    /// Sent when the framebuffer goes from nothing to repaint to something, so one event can
+    /// stand for many graphics updates: take the area with
+    /// [`Framebuffer::take_dirty`](crate::framebuffer::Framebuffer::take_dirty).
+    FramebufferUpdated,
     ConnectionFailure(ironrdp_connector::ConnectorError),
     PointerDefault,
     PointerHidden,
@@ -219,6 +227,7 @@ impl RdpOutputEvent {
 
         match self {
             RdpOutputEvent::Image { .. }
+            | RdpOutputEvent::FramebufferUpdated
             | RdpOutputEvent::PointerDefault
             | RdpOutputEvent::PointerHidden
             | RdpOutputEvent::PointerPosition { .. }
@@ -647,6 +656,7 @@ pub struct RdpClient {
     cliprdr_backend_factory: Option<Box<dyn CliprdrBackendFactory + Send>>,
     #[cfg(feature = "rdpdr")]
     rdpdr_backend_factory: Option<Box<dyn RdpdrBackendFactory + Send>>,
+    framebuffer: Option<SharedFramebuffer>,
 }
 
 impl RdpClient {
@@ -671,6 +681,7 @@ impl RdpClient {
             cliprdr_backend_factory: None,
             #[cfg(feature = "rdpdr")]
             rdpdr_backend_factory: None,
+            framebuffer: None,
         }
     }
 
@@ -690,6 +701,15 @@ impl RdpClient {
     #[must_use]
     pub fn with_rdpdr_backend_factory(mut self, factory: Box<dyn RdpdrBackendFactory + Send>) -> Self {
         self.rdpdr_backend_factory = Some(factory);
+        self
+    }
+
+    /// Keeps the desktop in `framebuffer`, updated in place for each graphics update, and
+    /// announces changes with [`RdpOutputEvent::FramebufferUpdated`] instead of sending
+    /// every frame as an [`RdpOutputEvent::Image`].
+    #[must_use]
+    pub fn with_shared_framebuffer(mut self, framebuffer: SharedFramebuffer) -> Self {
+        self.framebuffer = Some(framebuffer);
         self
     }
 
@@ -1070,6 +1090,7 @@ impl RdpClient {
                 udp_tunnel,
                 self.config.rail_initial_execute.clone(),
                 &self.output_event_sender,
+                self.framebuffer.as_ref(),
                 &mut self.input_event_receiver,
                 &mut self.clipboard_event_receiver,
                 &mut self.close_receiver,
@@ -2840,6 +2861,10 @@ enum RdpControlFlow {
 
 /// Per-second session performance counters, logged at INFO as `session perf` so
 /// transports (TCP vs reliable UDP) can be compared from the log alone.
+///
+/// `busy_pct` is PDU decoding, `convert_pct` turning decoded graphics into the host's
+/// framebuffer, and `present_pct` the host's own presenting as it reports it through
+/// [`Framebuffer::record_present`](crate::framebuffer::Framebuffer::record_present).
 struct PerfCounters {
     started: Instant,
     last_report: Instant,
@@ -2850,6 +2875,8 @@ struct PerfCounters {
     /// Time spent decoding/processing inbound PDUs since the last report.
     busy: Duration,
     busy_total: Duration,
+    /// Time spent converting decoded graphics for the host since the last report.
+    convert: Duration,
     last_frames: u32,
     first_frames: Option<u32>,
     /// The `(reliable_udp, udp_version)` pair last announced as `RdpOutputEvent::Transport`.
@@ -2868,6 +2895,7 @@ impl PerfCounters {
             udp_bytes_total: 0,
             busy: Duration::ZERO,
             busy_total: Duration::ZERO,
+            convert: Duration::ZERO,
             last_frames: 0,
             first_frames: None,
             announced_transport: None,
@@ -2897,11 +2925,12 @@ impl PerfCounters {
         clippy::as_conversions,
         reason = "u64-to-f64 loses precision only above 2^53 bytes, acceptable for a log line"
     )]
-    fn report_if_due(&mut self, active_stage: &ActiveStage) {
+    fn report_if_due(&mut self, active_stage: &ActiveStage, framebuffer: Option<&SharedFramebuffer>) {
         let elapsed = self.last_report.elapsed();
         if elapsed < Duration::from_secs(1) {
             return;
         }
+        let present = framebuffer.map_or(Duration::ZERO, |framebuffer| framebuffer.lock().take_present_time());
         let frames_decoded = active_stage
             .get_dvc::<GraphicsPipelineClient>()
             .map(|gfx| gfx.processor().total_frames_decoded())
@@ -2922,6 +2951,8 @@ impl PerfCounters {
             fps = format_args!("{:.1}", f64::from(frames) / secs),
             kbps = format_args!("{:.0}", bytes as f64 * 8.0 / 1000.0 / secs),
             busy_pct = format_args!("{:.1}", self.busy.as_secs_f64() * 100.0 / secs),
+            convert_pct = format_args!("{:.1}", self.convert.as_secs_f64() * 100.0 / secs),
+            present_pct = format_args!("{:.1}", present.as_secs_f64() * 100.0 / secs),
             tcp_bytes = self.tcp_bytes,
             udp_bytes = self.udp_bytes,
             frames_total = frames_decoded.wrapping_sub(first),
@@ -2937,7 +2968,12 @@ impl PerfCounters {
         self.tcp_bytes = 0;
         self.udp_bytes = 0;
         self.busy = Duration::ZERO;
+        self.convert = Duration::ZERO;
         self.last_report = Instant::now();
+    }
+
+    fn account_conversion(&mut self, elapsed: Duration) {
+        self.convert += elapsed;
     }
 
     fn account_tcp(&mut self, len: usize, busy: Duration) {
@@ -3062,6 +3098,7 @@ async fn active_session(
     #[cfg(not(feature = "udp"))] _udp_tunnel: UdpTunnel,
     initial_rail_execute: Option<ExecutePdu>,
     output_event_sender: &crate::output_channel::OutputEventSender,
+    framebuffer: Option<&SharedFramebuffer>,
     input_event_receiver: &mut mpsc::Receiver<RdpInputEvent>,
     clipboard_event_receiver: &mut mpsc::UnboundedReceiver<RdpInputEvent>,
     close_receiver: &mut watch::Receiver<bool>,
@@ -3078,6 +3115,9 @@ async fn active_session(
     let mut suppress_output_support = connection_result.suppress_output_support;
     let window_support_level = connection_result.window_support_level;
     let mut image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
+    if let Some(framebuffer) = framebuffer {
+        framebuffer.lock().invalidate();
+    }
 
     // We retain the factory to drive the Deactivation-Reactivation Sequence locally.
     let activation_factory = connection_result.activation_factory;
@@ -3751,14 +3791,18 @@ async fn active_session(
             }
         };
 
-        perf.report_if_due(&active_stage);
+        perf.report_if_due(&active_stage, framebuffer);
         if framebuffer_size != (image.width(), image.height()) {
             // The graphics pipeline resized the framebuffer (see
             // `ActiveStage::drain_graphics_pipeline`); that is how a resize completes
             // on EGFX, so stop waiting for a reactivation that will not come.
             framebuffer_size = (image.width(), image.height());
             if resize_queue.in_flight.take().is_some() {
-                info!(width = framebuffer_size.0, height = framebuffer_size.1, "Resize completed by the graphics pipeline");
+                info!(
+                    width = framebuffer_size.0,
+                    height = framebuffer_size.1,
+                    "Resize completed by the graphics pipeline"
+                );
             }
         }
         #[cfg(feature = "udp")]
@@ -3839,29 +3883,38 @@ async fn active_session(
                         )));
                     }
                 }
-                ActiveStageOutput::GraphicsUpdate(_region) => {
-                    let buffer: Vec<u32> = image
-                        .data()
-                        .chunks_exact(4)
-                        .map(|pixel| {
-                            let r = pixel[0];
-                            let g = pixel[1];
-                            let b = pixel[2];
-                            u32::from_be_bytes([0, r, g, b])
-                        })
-                        .collect();
-                    if !send_active_output_event(
-                        output_event_sender,
-                        RdpOutputEvent::Image {
-                            buffer,
-                            width: NonZeroU16::new(image.width())
-                                .ok_or_else(|| ironrdp_session::general_err!("width is zero"))?,
-                            height: NonZeroU16::new(image.height())
-                                .ok_or_else(|| ironrdp_session::general_err!("height is zero"))?,
-                        },
-                        close_receiver,
-                    )
-                    .await?
+                ActiveStageOutput::GraphicsUpdate(region) => {
+                    let converting = Instant::now();
+                    let event = match framebuffer {
+                        // Only the host's first look at a pending area needs an event; later
+                        // updates merge into that area.
+                        Some(framebuffer) => framebuffer
+                            .lock()
+                            .update(image.data(), image.width(), image.height(), &region)
+                            .then_some(RdpOutputEvent::FramebufferUpdated),
+                        None => {
+                            let buffer: Vec<u32> = image
+                                .data()
+                                .chunks_exact(4)
+                                .map(|pixel| {
+                                    let r = pixel[0];
+                                    let g = pixel[1];
+                                    let b = pixel[2];
+                                    u32::from_be_bytes([0, r, g, b])
+                                })
+                                .collect();
+                            Some(RdpOutputEvent::Image {
+                                buffer,
+                                width: NonZeroU16::new(image.width())
+                                    .ok_or_else(|| ironrdp_session::general_err!("width is zero"))?,
+                                height: NonZeroU16::new(image.height())
+                                    .ok_or_else(|| ironrdp_session::general_err!("height is zero"))?,
+                            })
+                        }
+                    };
+                    perf.account_conversion(converting.elapsed());
+                    if let Some(event) = event
+                        && !send_active_output_event(output_event_sender, event, close_receiver).await?
                     {
                         return Ok(RdpControlFlow::TerminatedGracefully(
                             GracefulDisconnectReason::UserInitiated,
@@ -4072,6 +4125,9 @@ async fn active_session(
                         {
                             debug!(?desktop_size, "Deactivation-Reactivation Sequence completed");
                             image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
+                            if let Some(framebuffer) = framebuffer {
+                                framebuffer.lock().invalidate();
+                            }
                             resize_queue.completed();
                             if !active_stage.reactivate(
                                 connection_activation.io_channel_id(),

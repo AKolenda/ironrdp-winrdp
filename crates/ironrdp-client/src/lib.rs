@@ -8,6 +8,7 @@
 #![allow(clippy::cast_sign_loss)]
 
 pub mod config;
+pub mod framebuffer;
 pub mod output_channel;
 pub mod rail;
 pub mod rdp;
