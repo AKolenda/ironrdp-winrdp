@@ -17,6 +17,7 @@ pub mod camera;
 pub mod cloud;
 pub mod config;
 pub mod egfx_cache;
+pub mod framebuffer;
 #[cfg(feature = "entra-auth")]
 pub mod entra;
 pub mod h264;

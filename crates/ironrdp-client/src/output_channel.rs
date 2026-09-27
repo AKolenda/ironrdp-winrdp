@@ -65,6 +65,9 @@ enum LatestPayload {
         width: NonZeroU16,
         height: NonZeroU16,
     },
+    /// Carries nothing: the pending area accumulates in the shared framebuffer itself, so
+    /// coalescing these loses no update.
+    FramebufferUpdated,
     PointerAppearance(PointerAppearance),
     PointerPosition {
         x: u16,
@@ -76,6 +79,7 @@ impl From<LatestPayload> for RdpOutputEvent {
     fn from(payload: LatestPayload) -> Self {
         match payload {
             LatestPayload::Image { buffer, width, height } => RdpOutputEvent::Image { buffer, width, height },
+            LatestPayload::FramebufferUpdated => RdpOutputEvent::FramebufferUpdated,
             LatestPayload::PointerAppearance(appearance) => appearance.into(),
             LatestPayload::PointerPosition { x, y } => RdpOutputEvent::PointerPosition { x, y },
         }
@@ -129,6 +133,7 @@ impl<T> LatestSlot<T> {
 /// update to one never clobbers a pending update to another.
 struct LatestSlots {
     image: LatestSlot<LatestPayload>,
+    framebuffer: LatestSlot<LatestPayload>,
     pointer_appearance: LatestSlot<LatestPayload>,
     pointer_position: LatestSlot<LatestPayload>,
 }
@@ -156,6 +161,7 @@ pub fn output_channel(capacity: usize) -> (OutputEventSender, OutputEventReceive
     let (must_deliver_tx, must_deliver_rx) = mpsc::channel(capacity);
     let latest = Arc::new(LatestSlots {
         image: LatestSlot::new(),
+        framebuffer: LatestSlot::new(),
         pointer_appearance: LatestSlot::new(),
         pointer_position: LatestSlot::new(),
     });
@@ -282,6 +288,7 @@ impl OutputEventSender {
         }
         Err(match event {
             RdpOutputEvent::Image { buffer, width, height } => LatestPayload::Image { buffer, width, height },
+            RdpOutputEvent::FramebufferUpdated => LatestPayload::FramebufferUpdated,
             RdpOutputEvent::PointerDefault => LatestPayload::PointerAppearance(PointerAppearance::Default),
             RdpOutputEvent::PointerHidden => LatestPayload::PointerAppearance(PointerAppearance::Hidden),
             RdpOutputEvent::PointerPosition { x, y } => LatestPayload::PointerPosition { x, y },
@@ -295,6 +302,7 @@ impl OutputEventSender {
     fn send_latest(&self, payload: LatestPayload) {
         let slot = match &payload {
             LatestPayload::Image { .. } => &self.latest.image,
+            LatestPayload::FramebufferUpdated => &self.latest.framebuffer,
             LatestPayload::PointerAppearance(_) => &self.latest.pointer_appearance,
             LatestPayload::PointerPosition { .. } => &self.latest.pointer_position,
         };
@@ -324,6 +332,7 @@ impl OutputEventReceiver {
 
         tokio::select! {
             payload = self.latest.image.recv() => Some(payload.into()),
+            payload = self.latest.framebuffer.recv() => Some(payload.into()),
             payload = self.latest.pointer_appearance.recv() => Some(payload.into()),
             payload = self.latest.pointer_position.recv() => Some(payload.into()),
             event = self.must_deliver.recv() => match event {
@@ -343,6 +352,7 @@ impl OutputEventReceiver {
     fn drain_latest_or_close(&self) -> Option<RdpOutputEvent> {
         for slot in [
             &self.latest.image,
+            &self.latest.framebuffer,
             &self.latest.pointer_appearance,
             &self.latest.pointer_position,
         ] {

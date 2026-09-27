@@ -28,6 +28,12 @@ use tracing::{debug, info, warn};
 const HELP: &str = "\
 USAGE:
   cargo run --example=server -- [--bind-addr <SOCKET ADDRESS>] [--cert <CERTIFICATE>] [--key <CERTIFICATE KEY>] [--user USERNAME] [--pass PASSWORD] [--sec tls|hybrid]
+                                [--size <WIDTH>x<HEIGHT>] [--interval-ms <MILLISECONDS>] [--max-rect <PIXELS>] [--seed <NUMBER>]
+
+  --size         desktop size (default 1920x1080)
+  --interval-ms  delay between two random bitmap updates (default 100)
+  --max-rect     largest width and height of a random bitmap update (default: the desktop size)
+  --seed         repeat the same sequence of bitmap updates for performance comparisons
 ";
 
 #[tokio::main(flavor = "current_thread")]
@@ -47,17 +53,10 @@ async fn main() -> Result<(), anyhow::Error> {
             println!("{HELP}");
             Ok(())
         }
-        Action::Run {
-            bind_addr,
-            hybrid,
-            user,
-            pass,
-            cert,
-            key,
-        } => {
+        Action::Run(config) => {
             // The server's future is large enough to trip clippy::large_futures,
             // so keep it on the heap rather than in main's stack frame.
-            Box::pin(run(bind_addr, hybrid, user, pass, cert, key)).await
+            Box::pin(run(config)).await
         }
     }
 }
@@ -65,14 +64,29 @@ async fn main() -> Result<(), anyhow::Error> {
 #[derive(Debug)]
 enum Action {
     ShowHelp,
-    Run {
-        bind_addr: SocketAddr,
-        hybrid: bool,
-        user: String,
-        pass: String,
-        cert: Option<PathBuf>,
-        key: Option<PathBuf>,
-    },
+    Run(ServerConfig),
+}
+
+#[derive(Debug)]
+struct ServerConfig {
+    bind_addr: SocketAddr,
+    hybrid: bool,
+    user: String,
+    pass: String,
+    cert: Option<PathBuf>,
+    key: Option<PathBuf>,
+    workload: Workload,
+}
+
+/// The stream of random bitmap updates the display sends.
+#[derive(Clone, Copy, Debug)]
+struct Workload {
+    width: u16,
+    height: u16,
+    interval: Duration,
+    /// Upper bound on the width and height of each update.
+    max_rect: u16,
+    seed: Option<u64>,
 }
 
 fn parse_args() -> anyhow::Result<Action> {
@@ -98,14 +112,36 @@ fn parse_args() -> anyhow::Result<Action> {
         let user = args.opt_value_from_str("--user")?.unwrap_or_else(|| "user".to_owned());
         let pass = args.opt_value_from_str("--pass")?.unwrap_or_else(|| "pass".to_owned());
 
-        Action::Run {
+        let (width, height) = match args.opt_value_from_str::<_, String>("--size")? {
+            Some(size) => size
+                .split_once('x')
+                .and_then(|(width, height)| Some((width.parse().ok()?, height.parse().ok()?)))
+                .filter(|&(width, height)| width > 0 && height > 0)
+                .with_context(|| format!("invalid size: '{size}'"))?,
+            None => (1920, 1080),
+        };
+        let interval = Duration::from_millis(args.opt_value_from_str("--interval-ms")?.unwrap_or(100));
+        let max_rect = args.opt_value_from_str("--max-rect")?.unwrap_or(u16::MAX);
+        if max_rect == 0 {
+            anyhow::bail!("--max-rect must be positive");
+        }
+        let seed = args.opt_value_from_str("--seed")?;
+
+        Action::Run(ServerConfig {
             bind_addr,
             hybrid,
             user,
             pass,
             cert,
             key,
-        }
+            workload: Workload {
+                width,
+                height,
+                interval,
+                max_rect,
+                seed,
+            },
+        })
     };
 
     Ok(action)
@@ -133,11 +169,13 @@ fn setup_logging() -> anyhow::Result<()> {
 }
 
 #[derive(Clone, Debug)]
-struct Handler;
+struct Handler {
+    workload: Workload,
+}
 
 impl Handler {
-    fn new() -> Self {
-        Self
+    fn new(workload: Workload) -> Self {
+        Self { workload }
     }
 }
 
@@ -151,23 +189,30 @@ impl RdpServerInputHandler for Handler {
     }
 }
 
-const WIDTH: u16 = 1920;
-const HEIGHT: u16 = 1080;
-
-struct DisplayUpdates;
+struct DisplayUpdates {
+    workload: Workload,
+    random: StdRng,
+}
 
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for DisplayUpdates {
     async fn next_update(&mut self) -> ironrdp::server::ServerResult<Option<DisplayUpdate>> {
-        sleep(Duration::from_millis(100)).await;
-        let mut rng = rand::rng();
+        let Workload {
+            width: desktop_width,
+            height: desktop_height,
+            interval,
+            max_rect,
+            ..
+        } = self.workload;
+        sleep(interval).await;
+        let rng = &mut self.random;
 
-        let y: u16 = rng.random_range(0..HEIGHT);
-        let height = rng.random_range(1..=HEIGHT.checked_sub(y).expect("never underflow"));
+        let y: u16 = rng.random_range(0..desktop_height);
+        let height = rng.random_range(1..=desktop_height.checked_sub(y).expect("never underflow").min(max_rect));
         let height = NonZeroU16::new(height).expect("never zero");
 
-        let x: u16 = rng.random_range(0..WIDTH);
-        let width = rng.random_range(1..=WIDTH.checked_sub(x).expect("never underflow"));
+        let x: u16 = rng.random_range(0..desktop_width);
+        let width = rng.random_range(1..=desktop_width.checked_sub(x).expect("never underflow").min(max_rect));
         let width = NonZeroU16::new(width).expect("never zero");
 
         let capacity = NonZeroUsize::from(width)
@@ -205,13 +250,19 @@ impl RdpServerDisplayUpdates for DisplayUpdates {
 impl RdpServerDisplay for Handler {
     async fn size(&mut self) -> DesktopSize {
         DesktopSize {
-            width: WIDTH,
-            height: HEIGHT,
+            width: self.workload.width,
+            height: self.workload.height,
         }
     }
 
     async fn updates(&mut self, _: DisplayContext) -> ironrdp::server::ServerResult<Box<dyn RdpServerDisplayUpdates>> {
-        Ok(Box::new(DisplayUpdates {}))
+        Ok(Box::new(DisplayUpdates {
+            workload: self.workload,
+            random: self
+                .workload
+                .seed
+                .map_or_else(StdRng::from_os_rng, StdRng::seed_from_u64),
+        }))
     }
 }
 
@@ -387,17 +438,19 @@ fn generate_sine_wave(sample_rate: u32, frequency: f32, duration_ms: u64, phase:
     samples
 }
 
-async fn run(
-    bind_addr: SocketAddr,
-    hybrid: bool,
-    username: String,
-    password: String,
-    cert: Option<PathBuf>,
-    key: Option<PathBuf>,
-) -> anyhow::Result<()> {
-    info!(%bind_addr, ?cert, ?key, "run");
+async fn run(config: ServerConfig) -> anyhow::Result<()> {
+    let ServerConfig {
+        bind_addr,
+        hybrid,
+        user: username,
+        pass: password,
+        cert,
+        key,
+        workload,
+    } = config;
+    info!(%bind_addr, ?cert, ?key, ?workload, "run");
 
-    let handler = Handler::new();
+    let handler = Handler::new(workload);
 
     let server_builder = RdpServer::builder().with_addr(bind_addr);
 

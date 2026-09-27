@@ -98,6 +98,7 @@ use ironrdp_rdpewa::{RdpewaClient, RdpewaClientListener};
 use ironrdp_rdpewa_native::{WindowsRdpewaBackend, WindowsRdpewaSessionState};
 
 use crate::config::{Config, RDCleanPathConfig, Transport};
+use crate::framebuffer::SharedFramebuffer;
 use crate::rail::{RailClient, RailControlEvent, RailEvent, RailInputEvent, RailSvcMessages};
 use ironrdp_rail::pdu::{ExecutePdu, ExecuteResultPdu};
 
@@ -159,6 +160,13 @@ pub enum RdpOutputEvent {
         width: NonZeroU16,
         height: NonZeroU16,
     },
+    /// The shared framebuffer has areas to repaint; replaces `Image` when the host supplied
+    /// one with [`RdpClient::with_shared_framebuffer`].
+    ///
+    /// Sent when the framebuffer goes from nothing to repaint to something, so one event can
+    /// stand for many graphics updates: take the area with
+    /// [`Framebuffer::take_dirty`](crate::framebuffer::Framebuffer::take_dirty).
+    FramebufferUpdated,
     /// A tightly packed changed region, delivered instead of a full [`RdpOutputEvent::Image`]
     /// snapshot when the embedder opted into [`DesktopUpdate`] delivery.
     ///
@@ -414,6 +422,7 @@ impl RdpOutputEvent {
             // that region's pixels forever instead of merely re-sending a stale-but-complete
             // framebuffer, so it falls through to `MustDeliver` below.
             RdpOutputEvent::Image { .. }
+            | RdpOutputEvent::FramebufferUpdated
             | RdpOutputEvent::PointerDefault
             | RdpOutputEvent::PointerHidden
             | RdpOutputEvent::PointerPosition { .. }
@@ -1176,6 +1185,7 @@ pub struct RdpClient {
     cliprdr_backend_factory: Option<Box<dyn CliprdrBackendFactory + Send>>,
     #[cfg(feature = "rdpdr")]
     rdpdr_backend_factory: Option<Box<dyn RdpdrBackendFactory + Send>>,
+    framebuffer: Option<SharedFramebuffer>,
 }
 
 impl RdpClient {
@@ -1201,6 +1211,7 @@ impl RdpClient {
             cliprdr_backend_factory: None,
             #[cfg(feature = "rdpdr")]
             rdpdr_backend_factory: None,
+            framebuffer: None,
         }
     }
 
@@ -1220,6 +1231,15 @@ impl RdpClient {
     #[must_use]
     pub fn with_rdpdr_backend_factory(mut self, factory: Box<dyn RdpdrBackendFactory + Send>) -> Self {
         self.rdpdr_backend_factory = Some(factory);
+        self
+    }
+
+    /// Keeps the desktop in `framebuffer`, updated in place for each graphics update, and
+    /// announces changes with [`RdpOutputEvent::FramebufferUpdated`] instead of sending
+    /// every frame as an [`RdpOutputEvent::Image`].
+    #[must_use]
+    pub fn with_shared_framebuffer(mut self, framebuffer: SharedFramebuffer) -> Self {
+        self.framebuffer = Some(framebuffer);
         self
     }
 
@@ -1672,6 +1692,7 @@ impl RdpClient {
                 udp_tunnel,
                 self.config.rail_initial_execute.clone(),
                 &self.output_event_sender,
+                self.framebuffer.as_ref(),
                 self.desktop_update_enabled,
                 &mut self.input_event_receiver,
                 &mut self.clipboard_event_receiver,
@@ -4605,6 +4626,7 @@ async fn active_session(
     #[cfg(not(feature = "udp"))] _udp_tunnel: UdpTunnel,
     initial_rail_execute: Option<ExecutePdu>,
     output_event_sender: &crate::output_channel::OutputEventSender,
+    framebuffer: Option<&SharedFramebuffer>,
     desktop_update_enabled: bool,
     input_event_receiver: &mut mpsc::Receiver<RdpInputEvent>,
     clipboard_event_receiver: &mut mpsc::UnboundedReceiver<RdpInputEvent>,
@@ -4624,6 +4646,9 @@ async fn active_session(
     let mut suppress_output_support = connection_result.suppress_output_support;
     let window_support_level = connection_result.window_support_level;
     let mut image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
+    if let Some(framebuffer) = framebuffer {
+        framebuffer.lock().invalidate();
+    }
     let mut desktop_update_extent = None;
 
     // We retain the factory to drive the Deactivation-Reactivation Sequence locally.
@@ -5522,6 +5547,26 @@ async fn active_session(
                         NonZeroU16::new(image.width()).ok_or_else(|| ironrdp_session::general_err!("width is zero"))?;
                     let height = NonZeroU16::new(image.height())
                         .ok_or_else(|| ironrdp_session::general_err!("height is zero"))?;
+                    if let Some(framebuffer) = framebuffer {
+                        // Only the host's first look at a pending area needs an event; later
+                        // updates merge into that area.
+                        let changed = framebuffer
+                            .lock()
+                            .update(image.data(), image.width(), image.height(), &region);
+                        if changed
+                            && !send_active_output_event(
+                                output_event_sender,
+                                RdpOutputEvent::FramebufferUpdated,
+                                close_receiver,
+                            )
+                            .await?
+                        {
+                            return Ok(RdpControlFlow::TerminatedGracefully(
+                                GracefulDisconnectReason::UserInitiated,
+                            ));
+                        }
+                        continue;
+                    }
                     if desktop_update_enabled {
                         if desktop_damage_delivered {
                             continue;
@@ -5831,6 +5876,9 @@ async fn active_session(
                         {
                             debug!(?desktop_size, "Deactivation-Reactivation Sequence completed");
                             image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
+                            if let Some(framebuffer) = framebuffer {
+                                framebuffer.lock().invalidate();
+                            }
                             desktop_update_extent = None;
                             resize_queue.completed();
                             if !active_stage.reactivate(
