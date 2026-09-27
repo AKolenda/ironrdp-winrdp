@@ -193,3 +193,10 @@ path = "fuzz_targets/egfx_surface_state.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "autodetect_state"
+path = "fuzz_targets/autodetect_state.rs"
+test = false
+doc = false
+bench = false

@@ -241,3 +241,102 @@ fn netchar_result_rejects_a_payload_that_contradicts_its_request_type() {
         "a baseRTT-carrying request type with no baseRTT must not encode"
     );
 }
+
+/// Server Auto-Detect Request PDUs ([MS-RDPBCGR] 2.2.14.3) of a continuous bandwidth
+/// measurement on the main connection, byte for byte: a TS_SECURITY_HEADER carrying
+/// SEC_AUTODETECT_REQ (0x1000), then the RDP_BW_START (2.2.14.1.2, requestType 0x0014) or
+/// RDP_BW_STOP (2.2.14.1.4, requestType 0x0429, no payloadLength) with a headerLength of 0x06.
+#[test]
+fn continuous_bandwidth_request_pdus_match_the_wire_format() {
+    use ironrdp_pdu::rdp::autodetect::AutoDetectReqPdu;
+
+    let cases: [(AutoDetectRequest, &[u8]); 2] = [
+        (
+            AutoDetectRequest::bw_start_continuous(0x0010),
+            &[
+                0x00, 0x10, 0x00, 0x00, // flags = SEC_AUTODETECT_REQ, flagsHi
+                0x06, 0x00, // headerLength, headerTypeId = TYPE_ID_AUTODETECT_REQUEST
+                0x10, 0x00, // sequenceNumber
+                0x14, 0x00, // requestType = 0x0014
+            ],
+        ),
+        (
+            AutoDetectRequest::bw_stop_continuous(0x0011),
+            &[
+                0x00, 0x10, 0x00, 0x00, // flags = SEC_AUTODETECT_REQ, flagsHi
+                0x06, 0x00, // headerLength, headerTypeId
+                0x11, 0x00, // sequenceNumber
+                0x29, 0x04, // requestType = 0x0429
+            ],
+        ),
+    ];
+
+    for (request, wire) in cases {
+        let pdu = AutoDetectReqPdu::new(request);
+        assert_eq!(encode_vec(&pdu).unwrap(), wire, "encoding {pdu:?}");
+        assert_eq!(decode::<AutoDetectReqPdu>(wire).unwrap(), pdu, "decoding {wire:02x?}");
+    }
+}
+
+/// Client Auto-Detect Response PDUs ([MS-RDPBCGR] 2.2.14.4), byte for byte: a
+/// TS_SECURITY_HEADER carrying SEC_AUTODETECT_RSP (0x2000), then the RDP_RTT_RESPONSE
+/// (2.2.14.2.1) or the RDP_BW_RESULTS (2.2.14.2.2, headerLength 0x0E) for either phase.
+#[test]
+fn auto_detect_response_pdus_match_the_wire_format() {
+    use ironrdp_pdu::rdp::autodetect::{
+        AutoDetectResponse, AutoDetectRspPdu, BW_RESULTS_CONNECT_TIME, BW_RESULTS_CONTINUOUS,
+    };
+
+    let cases: [(AutoDetectResponse, &[u8]); 3] = [
+        (
+            AutoDetectResponse::RttResponse {
+                sequence_number: 0x1234,
+            },
+            &[
+                0x00, 0x20, 0x00, 0x00, // flags = SEC_AUTODETECT_RSP, flagsHi
+                0x06, 0x01, // headerLength, headerTypeId = TYPE_ID_AUTODETECT_RESPONSE
+                0x34, 0x12, // sequenceNumber
+                0x00, 0x00, // responseType = 0x0000
+            ],
+        ),
+        (
+            AutoDetectResponse::BandwidthMeasureResults {
+                sequence_number: 0x0011,
+                response_type: BW_RESULTS_CONTINUOUS,
+                time_delta_ms: 250,
+                byte_count: 0x0001_86a0,
+            },
+            &[
+                0x00, 0x20, 0x00, 0x00, // flags = SEC_AUTODETECT_RSP, flagsHi
+                0x0e, 0x01, // headerLength, headerTypeId
+                0x11, 0x00, // sequenceNumber
+                0x0b, 0x00, // responseType = 0x000B
+                0xfa, 0x00, 0x00, 0x00, // timeDelta = 250
+                0xa0, 0x86, 0x01, 0x00, // byteCount = 100000
+            ],
+        ),
+        (
+            AutoDetectResponse::BandwidthMeasureResults {
+                sequence_number: 0x0004,
+                response_type: BW_RESULTS_CONNECT_TIME,
+                time_delta_ms: 1,
+                byte_count: 520,
+            },
+            &[
+                0x00, 0x20, 0x00, 0x00, // flags = SEC_AUTODETECT_RSP, flagsHi
+                0x0e, 0x01, // headerLength, headerTypeId
+                0x04, 0x00, // sequenceNumber
+                0x03, 0x00, // responseType = 0x0003
+                0x01, 0x00, 0x00, 0x00, // timeDelta = 1
+                0x08, 0x02, 0x00, 0x00, // byteCount = 520
+            ],
+        ),
+    ];
+
+    for (response, wire) in cases {
+        let pdu = AutoDetectRspPdu::new(response);
+        assert_eq!(pdu.size(), wire.len());
+        assert_eq!(encode_vec(&pdu).unwrap(), wire, "encoding {pdu:?}");
+        assert_eq!(decode::<AutoDetectRspPdu>(wire).unwrap(), pdu, "decoding {wire:02x?}");
+    }
+}

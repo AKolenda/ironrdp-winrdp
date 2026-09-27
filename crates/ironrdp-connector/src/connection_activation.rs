@@ -1,5 +1,7 @@
 use core::mem;
 
+use ironrdp_autodetect::AutoDetectState;
+use ironrdp_core::{Decode as _, ReadCursor};
 use ironrdp_pdu::rdp;
 use ironrdp_pdu::rdp::capability_sets::{
     CapabilitySet, InputFlags, Rail, RailSupportLevel, WindowList, WindowSupportLevel,
@@ -33,6 +35,9 @@ pub struct ConnectionActivationSequence {
     // here (rather than duplicated into every state variant).
     io_channel_id: u16,
     user_channel_id: u16,
+    /// Message channel used to answer auto-detect requests during reactivation.
+    message_channel_id: Option<u16>,
+    autodetect: AutoDetectState,
 }
 
 impl ConnectionActivationSequence {
@@ -46,7 +51,28 @@ impl ConnectionActivationSequence {
             config,
             io_channel_id,
             user_channel_id,
+            message_channel_id: None,
+            autodetect: AutoDetectState::default(),
         }
+    }
+
+    /// Sets the MCS message channel negotiated for this connection.
+    ///
+    /// Auto-Detect Requests ([\[MS-RDPBCGR\] 2.2.14.3]) are handled separately from
+    /// activation PDUs. RTT and bandwidth requests are answered without advancing
+    /// the activation sequence. Transfer an existing measurement through
+    /// [`Self::autodetect_state_mut`] when reactivating an active session.
+    ///
+    /// [\[MS-RDPBCGR\] 2.2.14.3]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/5a53eadd-64a2-430d-b197-56bdf7ac9ee9
+    #[must_use]
+    pub fn with_message_channel_id(mut self, message_channel_id: Option<u16>) -> Self {
+        self.message_channel_id = message_channel_id;
+        self
+    }
+
+    /// Borrows network detection state for transfer to and from the active session.
+    pub fn autodetect_state_mut(&mut self) -> &mut AutoDetectState {
+        &mut self.autodetect
     }
 
     pub fn io_channel_id(&self) -> u16 {
@@ -82,6 +108,7 @@ pub struct ConnectionActivationFactory {
     config: Config,
     io_channel_id: u16,
     user_channel_id: u16,
+    message_channel_id: Option<u16>,
     multitransport_soft_sync: bool,
 }
 
@@ -91,8 +118,17 @@ impl ConnectionActivationFactory {
             config,
             io_channel_id,
             user_channel_id,
+            message_channel_id: None,
             multitransport_soft_sync: false,
         }
+    }
+
+    /// Sets the MCS message channel handed to every sequence this factory creates; see
+    /// [`ConnectionActivationSequence::with_message_channel_id`].
+    #[must_use]
+    pub fn with_message_channel_id(mut self, message_channel_id: Option<u16>) -> Self {
+        self.message_channel_id = message_channel_id;
+        self
     }
 
     pub(crate) fn with_multitransport_soft_sync(mut self, multitransport_soft_sync: bool) -> Self {
@@ -116,6 +152,7 @@ impl ConnectionActivationFactory {
     #[must_use]
     pub fn create(&self) -> ConnectionActivationSequence {
         ConnectionActivationSequence::new(self.config.clone(), self.io_channel_id, self.user_channel_id)
+            .with_message_channel_id(self.message_channel_id)
     }
 }
 
@@ -142,6 +179,41 @@ impl Sequence for ConnectionActivationSequence {
         received_at: Option<MonotonicInstant>,
         output: &mut ironrdp_core::WriteBuf,
     ) -> ConnectorResult<Written> {
+        // The server can keep probing while activation waits for its own PDUs.
+        // Count incoming data before dispatch so Stops and activation PDUs both
+        // contribute to an open continuous measurement.
+        if self.next_pdu_hint().is_some() {
+            if let Ok(data) = ironrdp_pdu::mcs::decode_send_data_indication(input) {
+                let mut payload = ReadCursor::new(data.user_data);
+                if self.message_channel_id == Some(data.channel_id) {
+                    rdp::headers::BasicSecurityHeader::decode(&mut payload).map_err(ConnectorError::decode)?;
+                }
+                self.autodetect.record_data(payload.len());
+            }
+            if let Some(message_channel_id) = self.message_channel_id {
+                match crate::connection::decode_message_channel_autodetect(input, message_channel_id) {
+                    Some(Ok(request)) => {
+                        let Some(response) = self.autodetect.process_request(&request, received_at) else {
+                            return Ok(Written::Nothing);
+                        };
+                        let response = rdp::autodetect::AutoDetectRspPdu::new(response);
+                        let written = crate::encode_send_data_request(
+                            self.user_channel_id,
+                            message_channel_id,
+                            &response,
+                            output,
+                        )?;
+                        return Written::from_size(written);
+                    }
+                    Some(Err(error)) => {
+                        debug!(%error, state = self.state.name(), "Skipping an undecodable Auto-Detect Request");
+                        return Ok(Written::Nothing);
+                    }
+                    None => {}
+                }
+            }
+        }
+
         let (written, next_state) = match mem::take(&mut self.state) {
             ConnectionActivationState::Consumed | ConnectionActivationState::Finalized { .. } => {
                 return Err(general_err!(

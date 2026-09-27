@@ -11,7 +11,7 @@ use std::borrow::Cow;
 
 use ironrdp_connector::MonotonicInstant;
 use ironrdp_connector::{ClientConnector, ClientConnectorState, Sequence as _, Written};
-use ironrdp_core::{WriteBuf, encode_vec};
+use ironrdp_core::{WriteBuf, decode, encode_vec};
 use ironrdp_pdu::mcs::{McsMessage, SendDataIndication};
 use ironrdp_pdu::rdp::autodetect::{AutoDetectReqPdu, AutoDetectRequest, AutoDetectResponse, AutoDetectRspPdu};
 use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
@@ -161,11 +161,11 @@ fn connect_time_bandwidth_measure_stop_is_answered_and_phase_continues() {
 ///
 /// The response frame is X224 > MCS SendDataRequest > Auto-Detect Response PDU.
 fn decode_bandwidth_results(output: &WriteBuf) -> (u32, u32) {
-    let X224(McsMessage::SendDataRequest(send_data)) = ironrdp_core::decode(output.filled()).unwrap() else {
+    let X224(McsMessage::SendDataRequest(send_data)) = decode(output.filled()).unwrap() else {
         panic!("expected a SendDataRequest in the response frame");
     };
 
-    let response = ironrdp_core::decode::<AutoDetectRspPdu>(&send_data.user_data).unwrap();
+    let response = decode::<AutoDetectRspPdu>(&send_data.user_data).unwrap();
     match response.response {
         AutoDetectResponse::BandwidthMeasureResults {
             time_delta_ms,
@@ -486,5 +486,463 @@ fn connect_time_bandwidth_second_start_discards_the_first_window() {
     assert_eq!(
         results.1, 1552,
         "the 4096 bytes counted before the second Start are discarded; only the second window's Payload and Stop, each with an 8-byte header, remain"
+    );
+}
+
+// ============================================================================
+// Auto-Detect Requests after the connect-time phase
+// ============================================================================
+//
+// The server may keep sending Auto-Detect Requests once licensing has started (Windows RDS hosts
+// do, see Devolutions/IronRDP#1629). Each later phase decoded whatever arrived as its own PDU, so
+// such a request ended the connection. They are now answered on the message channel, and the phase
+// keeps waiting for its own PDU.
+
+/// A license cache that never has a license, so the licensing sequence can be built directly.
+#[derive(Debug)]
+struct NoLicenses;
+
+impl ironrdp_connector::LicenseCache for NoLicenses {
+    fn get_license(
+        &self,
+        _license_info: ironrdp_pdu::rdp::server_license::LicenseInformation,
+    ) -> ironrdp_connector::ConnectorResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    fn store_license(
+        &self,
+        _license_info: ironrdp_pdu::rdp::server_license::LicenseInformation,
+    ) -> ironrdp_connector::ConnectorResult<()> {
+        Ok(())
+    }
+}
+
+/// A client connector with a negotiated message channel, in the given state.
+fn connector_in(state: ClientConnectorState) -> ClientConnector {
+    let mut connector = ClientConnector::new(super::test_config(), "127.0.0.1:12345".parse().unwrap());
+    connector.state = state;
+    connector.message_channel_id = Some(MESSAGE_CHANNEL_ID);
+    connector
+}
+
+fn licensing_state() -> ClientConnectorState {
+    ClientConnectorState::LicensingExchange {
+        io_channel_id: IO_CHANNEL_ID,
+        user_channel_id: USER_CHANNEL_ID,
+        license_exchange: ironrdp_connector::LicenseExchangeSequence::new(
+            IO_CHANNEL_ID,
+            "test".to_owned(),
+            None,
+            [0; 4],
+            std::sync::Arc::new(NoLicenses),
+        ),
+    }
+}
+
+fn server_autodetect(request: AutoDetectRequest) -> Vec<u8> {
+    server_send_data_indication(MESSAGE_CHANNEL_ID, encode_vec(&AutoDetectReqPdu::new(request)).unwrap())
+}
+
+/// Unwrap an RTT Measure Response and check that it goes from the user channel to the message
+/// channel. Returns its sequence number.
+fn decode_rtt_response(output: &WriteBuf) -> u16 {
+    let X224(McsMessage::SendDataRequest(send_data)) = decode(output.filled()).unwrap() else {
+        panic!("expected a SendDataRequest in the response frame");
+    };
+    assert_eq!(send_data.initiator_id, USER_CHANNEL_ID);
+    assert_eq!(send_data.channel_id, MESSAGE_CHANNEL_ID);
+
+    match decode::<AutoDetectRspPdu>(&send_data.user_data).unwrap().response {
+        AutoDetectResponse::RttResponse { sequence_number } => sequence_number,
+        other => panic!("expected RttResponse, got {other:?}"),
+    }
+}
+
+/// The licensing PDU that completes licensing in one step ([MS-RDPELE] 3.1.5.3.1).
+fn status_valid_client_license() -> Vec<u8> {
+    let license = LicensePdu::LicensingErrorMessage(LicensingErrorMessage {
+        license_header: LicenseHeader {
+            security_header: BasicSecurityHeader {
+                flags: BasicSecurityHeaderFlags::LICENSE_PKT,
+            },
+            preamble_message_type: PreambleType::ErrorAlert,
+            preamble_flags: PreambleFlags::empty(),
+            preamble_version: PreambleVersion::V3,
+            preamble_message_size: 0x10,
+        },
+        error_code: LicenseErrorCode::StatusValidClient,
+        state_transition: LicensingStateTransition::NoTransition,
+        error_info: Vec::new(),
+    });
+    server_send_data_indication(IO_CHANNEL_ID, encode_vec(&license).unwrap())
+}
+
+#[test]
+fn rtt_request_during_licensing_is_answered_and_licensing_continues() {
+    let mut connector = connector_in(licensing_state());
+    let mut output = WriteBuf::new();
+
+    for (sequence_number, request) in [
+        (0x0101, AutoDetectRequest::rtt_connect_time(0x0101)),
+        (0x0102, AutoDetectRequest::rtt_continuous(0x0102)),
+    ] {
+        output.clear();
+        let written = connector.step(&server_autodetect(request), None, &mut output).unwrap();
+        assert_eq!(written.size(), Some(output.filled().len()));
+        assert_eq!(decode_rtt_response(&output), sequence_number);
+        assert!(matches!(
+            connector.state,
+            ClientConnectorState::LicensingExchange { .. }
+        ));
+    }
+
+    output.clear();
+    connector
+        .step(&status_valid_client_license(), None, &mut output)
+        .unwrap();
+    assert!(
+        matches!(
+            connector.state,
+            ClientConnectorState::MultitransportBootstrapping { .. }
+        ),
+        "the licensing PDU after the probes still completes licensing"
+    );
+}
+
+/// The exact PDU reported in Devolutions/IronRDP#1629: a continuous Bandwidth Measure Start
+/// (0x0014) sent by a Windows RDS host between licensing PDUs. It has no reply, and it must not
+/// be decoded as a licensing PDU.
+#[test]
+fn continuous_bandwidth_start_during_licensing_is_skipped() {
+    let mut connector = connector_in(licensing_state());
+    let mut output = WriteBuf::new();
+
+    let frame = server_send_data_indication(
+        MESSAGE_CHANNEL_ID,
+        vec![0x00, 0x10, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x14, 0x00],
+    );
+    let written = connector.step(&frame, None, &mut output).unwrap();
+
+    assert_eq!(written, Written::Nothing);
+    assert!(matches!(
+        connector.state,
+        ClientConnectorState::LicensingExchange { .. }
+    ));
+}
+
+#[test]
+fn undecodable_auto_detect_request_during_licensing_is_skipped() {
+    let mut connector = connector_in(licensing_state());
+    let mut output = WriteBuf::new();
+
+    // SEC_AUTODETECT_REQ with an unknown requestType (0xFFFF).
+    let frame = server_send_data_indication(
+        MESSAGE_CHANNEL_ID,
+        vec![0x00, 0x10, 0x00, 0x00, 0x06, 0x00, 0x01, 0x00, 0xff, 0xff],
+    );
+    let written = connector.step(&frame, None, &mut output).unwrap();
+
+    assert_eq!(written, Written::Nothing);
+    assert!(matches!(
+        connector.state,
+        ClientConnectorState::LicensingExchange { .. }
+    ));
+}
+
+/// A connect-time measurement that overlaps licensing is timed exactly as it is during the
+/// connect-time phase.
+#[test]
+fn connect_time_bandwidth_during_licensing_is_measured() {
+    let mut connector = connector_in(licensing_state());
+    let mut output = WriteBuf::new();
+
+    for (request, arrival) in [
+        (AutoDetectRequest::bw_start_connect_time(0x0a0a), 1_000),
+        (AutoDetectRequest::bw_payload(0x0a0a, vec![0u8; 1024]), 1_040),
+        (AutoDetectRequest::bw_stop_connect_time(0x0a0a, vec![0u8; 512]), 1_100),
+    ] {
+        output.clear();
+        connector
+            .step(
+                &server_autodetect(request),
+                Some(MonotonicInstant::from_millis(arrival)),
+                &mut output,
+            )
+            .unwrap();
+    }
+
+    assert_eq!(decode_bandwidth_results(&output), (100, 1024 + 8 + 512 + 8));
+    assert!(matches!(
+        connector.state,
+        ClientConnectorState::LicensingExchange { .. }
+    ));
+}
+
+#[test]
+fn rtt_request_during_multitransport_bootstrapping_is_answered() {
+    let mut connector = connector_in(ClientConnectorState::MultitransportBootstrapping {
+        io_channel_id: IO_CHANNEL_ID,
+        user_channel_id: USER_CHANNEL_ID,
+        message_channel_id: Some(MESSAGE_CHANNEL_ID),
+        requests_seen: 0,
+    });
+    let mut output = WriteBuf::new();
+
+    connector
+        .step(
+            &server_autodetect(AutoDetectRequest::rtt_continuous(0x0203)),
+            None,
+            &mut output,
+        )
+        .unwrap();
+
+    assert_eq!(decode_rtt_response(&output), 0x0203);
+    assert!(
+        matches!(
+            connector.state,
+            ClientConnectorState::MultitransportBootstrapping { requests_seen: 0, .. }
+        ),
+        "an auto-detect request is not counted as a multitransport request"
+    );
+}
+
+fn server_demand_active() -> Vec<u8> {
+    use ironrdp_pdu::rdp::headers::{ShareControlHeader, ShareControlPdu};
+
+    let header = ShareControlHeader {
+        share_control_pdu: ShareControlPdu::ServerDemandActive(
+            ironrdp_testsuite_core::capsets::SERVER_DEMAND_ACTIVE.clone(),
+        ),
+        pdu_source: USER_CHANNEL_ID,
+        share_id: 0x0001_0000,
+    };
+    server_send_data_indication(IO_CHANNEL_ID, encode_vec(&header).unwrap())
+}
+
+/// Steps through the finalization PDUs the client sends unprompted, up to the point where the
+/// sequence waits for the server's.
+fn run_until_input_is_needed(sequence: &mut dyn ironrdp_connector::Sequence) {
+    let mut output = WriteBuf::new();
+    while sequence.next_pdu_hint().is_none() && !sequence.state().is_terminal() {
+        output.clear();
+        sequence.step(&[], None, &mut output).unwrap();
+    }
+}
+
+#[test]
+fn rtt_request_during_capabilities_exchange_and_finalization_is_answered() {
+    use ironrdp_connector::connection_activation::ConnectionActivationSequence;
+
+    let mut connector = connector_in(ClientConnectorState::CapabilitiesExchange {
+        connection_activation: ConnectionActivationSequence::new(super::test_config(), IO_CHANNEL_ID, USER_CHANNEL_ID),
+    });
+    let mut output = WriteBuf::new();
+
+    connector
+        .step(
+            &server_autodetect(AutoDetectRequest::rtt_continuous(0x0301)),
+            None,
+            &mut output,
+        )
+        .unwrap();
+    assert_eq!(decode_rtt_response(&output), 0x0301);
+    assert!(matches!(
+        connector.state,
+        ClientConnectorState::CapabilitiesExchange { .. }
+    ));
+
+    output.clear();
+    connector.step(&server_demand_active(), None, &mut output).unwrap();
+    assert!(matches!(
+        connector.state,
+        ClientConnectorState::ConnectionFinalization { .. }
+    ));
+    run_until_input_is_needed(&mut connector);
+
+    output.clear();
+    connector
+        .step(
+            &server_autodetect(AutoDetectRequest::rtt_continuous(0x0302)),
+            None,
+            &mut output,
+        )
+        .unwrap();
+    assert_eq!(decode_rtt_response(&output), 0x0302);
+    assert!(matches!(
+        connector.state,
+        ClientConnectorState::ConnectionFinalization { .. }
+    ));
+    assert!(
+        connector.next_pdu_hint().is_some(),
+        "finalization still waits for the server's PDUs"
+    );
+}
+
+/// The Deactivation-Reactivation Sequence drives a `ConnectionActivationSequence` directly, with
+/// continuous auto-detection still running on the server. Given the message channel, the sequence
+/// answers RTT requests in both of its waiting states.
+#[test]
+fn reactivation_sequence_answers_rtt_requests_on_the_message_channel() {
+    use ironrdp_connector::connection_activation::{ConnectionActivationFactory, ConnectionActivationState};
+
+    let mut sequence = ConnectionActivationFactory::new(super::test_config(), IO_CHANNEL_ID, USER_CHANNEL_ID)
+        .with_message_channel_id(Some(MESSAGE_CHANNEL_ID))
+        .create();
+    let mut output = WriteBuf::new();
+
+    sequence
+        .step(
+            &server_autodetect(AutoDetectRequest::rtt_continuous(0x0401)),
+            None,
+            &mut output,
+        )
+        .unwrap();
+    assert_eq!(decode_rtt_response(&output), 0x0401);
+
+    output.clear();
+    let written = sequence
+        .step(
+            &server_autodetect(AutoDetectRequest::bw_start_continuous(0x0402)),
+            None,
+            &mut output,
+        )
+        .unwrap();
+    assert_eq!(written, Written::Nothing, "a bandwidth Start requires no response");
+    assert!(matches!(
+        sequence.connection_activation_state(),
+        ConnectionActivationState::CapabilitiesExchange
+    ));
+
+    output.clear();
+    sequence.step(&server_demand_active(), None, &mut output).unwrap();
+    run_until_input_is_needed(&mut sequence);
+
+    output.clear();
+    sequence
+        .step(
+            &server_autodetect(AutoDetectRequest::rtt_continuous(0x0403)),
+            None,
+            &mut output,
+        )
+        .unwrap();
+    assert_eq!(decode_rtt_response(&output), 0x0403);
+    assert!(matches!(
+        sequence.connection_activation_state(),
+        ConnectionActivationState::ConnectionFinalization { .. }
+    ));
+}
+
+/// Without a message channel the sequence has nowhere to answer, and keeps its old behavior.
+#[test]
+fn reactivation_sequence_without_a_message_channel_does_not_take_auto_detect_requests() {
+    use ironrdp_connector::connection_activation::ConnectionActivationSequence;
+
+    let mut sequence = ConnectionActivationSequence::new(super::test_config(), IO_CHANNEL_ID, USER_CHANNEL_ID);
+    let mut output = WriteBuf::new();
+
+    assert!(
+        sequence
+            .step(
+                &server_autodetect(AutoDetectRequest::rtt_continuous(0x0501)),
+                None,
+                &mut output
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn reactivation_bandwidth_counts_activation_pdus_and_answers_stop() {
+    use ironrdp_connector::connection_activation::ConnectionActivationFactory;
+
+    let mut sequence = ConnectionActivationFactory::new(super::test_config(), IO_CHANNEL_ID, USER_CHANNEL_ID)
+        .with_message_channel_id(Some(MESSAGE_CHANNEL_ID))
+        .create();
+    let mut output = WriteBuf::new();
+    sequence
+        .step(
+            &server_autodetect(AutoDetectRequest::bw_start_continuous(1)),
+            Some(MonotonicInstant::from_millis(100)),
+            &mut output,
+        )
+        .unwrap();
+    let demand_active = server_demand_active();
+    let data_len = ironrdp_pdu::mcs::decode_send_data_indication(&demand_active)
+        .unwrap()
+        .user_data
+        .len();
+    sequence.step(&demand_active, None, &mut output).unwrap();
+    run_until_input_is_needed(&mut sequence);
+    output.clear();
+    sequence
+        .step(
+            &server_autodetect(AutoDetectRequest::bw_stop_continuous(2)),
+            Some(MonotonicInstant::from_millis(150)),
+            &mut output,
+        )
+        .unwrap();
+    assert_eq!(
+        decode_bandwidth_results(&output),
+        (50, u32::try_from(data_len).unwrap() + 6)
+    );
+}
+
+#[test]
+fn continuous_measurement_survives_transfer_between_session_and_reactivation() {
+    use ironrdp_connector::connection_activation::ConnectionActivationFactory;
+    use ironrdp_session::x224::{Processor, ProcessorOutput};
+    use ironrdp_svc::StaticChannelSet;
+
+    let mut processor = Processor::new(
+        StaticChannelSet::new(),
+        USER_CHANNEL_ID,
+        IO_CHANNEL_ID,
+        Some(MESSAGE_CHANNEL_ID),
+        0,
+    );
+    processor
+        .process_with_timestamp(
+            &server_autodetect(AutoDetectRequest::bw_start_continuous(1)),
+            &mut None,
+            Some(MonotonicInstant::from_millis(100)),
+        )
+        .unwrap();
+    let mut sequence = ConnectionActivationFactory::new(super::test_config(), IO_CHANNEL_ID, USER_CHANNEL_ID)
+        .with_message_channel_id(Some(MESSAGE_CHANNEL_ID))
+        .create();
+    core::mem::swap(processor.autodetect_state_mut(), sequence.autodetect_state_mut());
+    let mut output = WriteBuf::new();
+    sequence
+        .step(
+            &server_autodetect(AutoDetectRequest::rtt_continuous(2)),
+            None,
+            &mut output,
+        )
+        .unwrap();
+    assert_eq!(decode_rtt_response(&output), 2);
+    core::mem::swap(processor.autodetect_state_mut(), sequence.autodetect_state_mut());
+    let responses = processor
+        .process_with_timestamp(
+            &server_autodetect(AutoDetectRequest::bw_stop_continuous(3)),
+            &mut None,
+            Some(MonotonicInstant::from_millis(160)),
+        )
+        .unwrap();
+    let [ProcessorOutput::ResponseFrame(frame)] = responses.as_slice() else {
+        panic!("expected bandwidth response after reactivation");
+    };
+    let X224(McsMessage::SendDataRequest(response)) = decode::<X224<McsMessage<'_>>>(frame).unwrap() else {
+        panic!("expected SendDataRequest");
+    };
+    let response = decode::<AutoDetectRspPdu>(&response.user_data).unwrap();
+    assert_eq!(
+        response.response,
+        AutoDetectResponse::BandwidthMeasureResults {
+            sequence_number: 3,
+            response_type: 0x000b,
+            time_delta_ms: 60,
+            byte_count: 12,
+        }
     );
 }

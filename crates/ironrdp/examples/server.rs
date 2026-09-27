@@ -28,12 +28,13 @@ use tracing::{debug, info, warn};
 const HELP: &str = "\
 USAGE:
   cargo run --example=server -- [--bind-addr <SOCKET ADDRESS>] [--cert <CERTIFICATE>] [--key <CERTIFICATE KEY>] [--user USERNAME] [--pass PASSWORD] [--sec tls|hybrid]
-                                [--size <WIDTH>x<HEIGHT>] [--interval-ms <MILLISECONDS>] [--max-rect <PIXELS>] [--seed <NUMBER>]
+                                [--size <WIDTH>x<HEIGHT>] [--interval-ms <MILLISECONDS>] [--max-rect <PIXELS>] [--seed <NUMBER>] [--autodetect <MILLISECONDS>]
 
   --size         desktop size (default 1920x1080)
   --interval-ms  delay between two random bitmap updates (default 100)
   --max-rect     largest width and height of a random bitmap update (default: the desktop size)
   --seed         repeat the same sequence of bitmap updates for performance comparisons
+  --autodetect   send an RTT probe every MILLISECONDS and a bandwidth measurement every eighth probe
 ";
 
 #[tokio::main(flavor = "current_thread")]
@@ -53,30 +54,26 @@ async fn main() -> Result<(), anyhow::Error> {
             println!("{HELP}");
             Ok(())
         }
-        Action::Run {
-            bind_addr,
-            hybrid,
-            user,
-            pass,
-            cert,
-            key,
-            workload,
-        } => run(bind_addr, hybrid, user, pass, cert, key, workload).await,
+        Action::Run(config) => run(config).await,
     }
 }
 
 #[derive(Debug)]
 enum Action {
     ShowHelp,
-    Run {
-        bind_addr: SocketAddr,
-        hybrid: bool,
-        user: String,
-        pass: String,
-        cert: Option<PathBuf>,
-        key: Option<PathBuf>,
-        workload: Workload,
-    },
+    Run(ServerConfig),
+}
+
+#[derive(Debug)]
+struct ServerConfig {
+    bind_addr: SocketAddr,
+    hybrid: bool,
+    user: String,
+    pass: String,
+    cert: Option<PathBuf>,
+    key: Option<PathBuf>,
+    workload: Workload,
+    autodetect_interval: Option<Duration>,
 }
 
 /// The stream of random bitmap updates the display sends.
@@ -127,8 +124,15 @@ fn parse_args() -> anyhow::Result<Action> {
             anyhow::bail!("--max-rect must be positive");
         }
         let seed = args.opt_value_from_str("--seed")?;
+        let autodetect_interval = args
+            .opt_value_from_str::<_, u64>("--autodetect")?
+            .map(Duration::from_millis);
+        anyhow::ensure!(
+            autodetect_interval.is_none_or(|interval| !interval.is_zero()),
+            "--autodetect interval must be greater than zero"
+        );
 
-        Action::Run {
+        Action::Run(ServerConfig {
             bind_addr,
             hybrid,
             user,
@@ -142,7 +146,8 @@ fn parse_args() -> anyhow::Result<Action> {
                 max_rect,
                 seed,
             },
-        }
+            autodetect_interval,
+        })
     };
 
     Ok(action)
@@ -439,16 +444,18 @@ fn generate_sine_wave(sample_rate: u32, frequency: f32, duration_ms: u64, phase:
     samples
 }
 
-async fn run(
-    bind_addr: SocketAddr,
-    hybrid: bool,
-    username: String,
-    password: String,
-    cert: Option<PathBuf>,
-    key: Option<PathBuf>,
-    workload: Workload,
-) -> anyhow::Result<()> {
-    info!(%bind_addr, ?cert, ?key, ?workload, "run");
+async fn run(config: ServerConfig) -> anyhow::Result<()> {
+    let ServerConfig {
+        bind_addr,
+        hybrid,
+        user: username,
+        pass: password,
+        cert,
+        key,
+        workload,
+        autodetect_interval,
+    } = config;
+    info!(%bind_addr, ?cert, ?key, ?workload, ?autodetect_interval, "Run");
 
     let handler = Handler::new(workload);
 
@@ -485,6 +492,20 @@ async fn run(
         password,
         domain: None,
     }));
+
+    if let Some(interval) = autodetect_interval {
+        server.enable_autodetect();
+        let sender = server.event_sender().clone();
+        tokio::spawn(async move {
+            let mut ticks = time::interval(interval);
+            loop {
+                ticks.tick().await;
+                if sender.send(ServerEvent::AutoDetectRttRequest).is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     Ok(server.run().await?)
 }

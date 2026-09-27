@@ -125,6 +125,11 @@ The crate forwards only location data supplied by its caller and performs no loc
 RDPEWA dynamic virtual channel for WebAuthn redirection as described in MS-RDPEWA.
 The Windows backend lives in [`crates/ironrdp-rdpewa-native`](./crates/ironrdp-rdpewa-native).
 
+#### [`crates/ironrdp-autodetect`](./crates/ironrdp-autodetect)
+
+Shared client network-characteristics detection state for connection establishment, reactivation, and active sessions.
+Arrival timestamps and received byte counts are supplied by the caller; this crate performs no I/O and never reads a clock.
+
 #### [`crates/ironrdp-connector`](./crates/ironrdp-connector)
 
 State machines to drive an RDP connection sequence.

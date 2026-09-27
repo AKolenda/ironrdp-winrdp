@@ -23,6 +23,11 @@ However,
 
 ## Targets
 
+### `autodetect_state`
+
+Exercises the shared client network-detection state with request sequences, untimed arrivals, clock regressions, and large byte counts.
+Checks that every bandwidth response has a nonzero divisor and every response survives a wire-format round trip.
+
 ### `pdu_decoding`
 
 Feeds random inputs to PDU decoding code.
