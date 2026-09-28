@@ -2,14 +2,16 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const OpenAI = require("openai");
 const {
   APIConnectionError, APIConnectionTimeoutError, APIUserAbortError,
-} = require("openai");
+} = OpenAI;
 
 const {
   AgentFailure, TOOLS, compileOutputValidator, executeTool, providerFailureDiagnostic,
   providerFailureReason, runAgent,
 } = require("../src/agent");
+const { RuntimeMetrics, createProviderClient, sanitizeReason } = require("../src/provider");
 
 const schema = {
   type: "object",
@@ -86,6 +88,7 @@ test("runtime executes only declared tools and returns schema-validated canonica
     output: '{"answer":"done"}',
     turnCount: 2,
     toolCallCount: 3,
+    outputRepairCount: 0,
   });
   assert.deepEqual(requests[0].tools, TOOLS);
   assert.deepEqual(TOOLS.map((tool) => tool.function.name), [
@@ -175,6 +178,8 @@ test("runtime reserves tool-free finalization and repair turns", async () => {
       message("not-json"),
       message('{"answer":"repaired"}'),
     ], requests),
+    // Without a validator a repair cannot use tools, so one repair call plus finalization
+    // reserves two, leaving two for investigation.
     config: baseConfig,
     methodologies: [],
     prompt: "p",
@@ -189,6 +194,60 @@ test("runtime reserves tool-free finalization and repair turns", async () => {
   assert.deepEqual(requests[2].response_format, { type: "json_object" });
   assert.deepEqual(requests[3].response_format, { type: "json_object" });
   assert.match(requests[2].messages.at(-1).content, /Investigation is complete/);
+});
+
+test("an undersized turn ceiling reports the validation error rather than the limit", async () => {
+  // The clamp can leave a repair without room for both an evidence call and the answer that
+  // follows it. Asking for the correction directly keeps the semantic reason on the failure.
+  const respond = (request) => request.tools !== undefined
+    ? message(null, [call("t", "read_file", { path: "x" })])
+    : message('{"answer":"bad"}');
+
+  await assert.rejects(
+    runAgent({
+      client: clientFrom(Array(8).fill(respond)),
+      config: { ...baseConfig, max_turns: 4, max_tool_calls: 8, max_output_repair_attempts: 2 },
+      methodologies: [], prompt: "p", sandbox, schema,
+      validator: async () => ({ ok: false, reason: "citation requires source verification" }),
+    }),
+    (error) => {
+      assert.match(error.reason, /citation requires source verification/);
+      assert.equal(error.category, "output-invalid");
+      return true;
+    },
+  );
+});
+
+test("a saturated investigation still leaves every repair attempt reachable", async () => {
+  // Each semantic rejection buys one evidence call before the next answer, so both repair
+  // attempts exercise the two-provider-call maximum. Tools are always taken, leaving the
+  // reservation alone to decide when investigation ends.
+  const answers = ['{"answer":"bad"}', '{"answer":"bad2"}', '{"answer":"good"}'];
+  const activities = [];
+  const respond = (request) => {
+    const toolsOffered = request.tools !== undefined;
+    activities.push(toolsOffered ? "tools" : "answer");
+    return toolsOffered
+      ? message(null, [call(`t${activities.length}`, "read_file", { path: "x" })])
+      : message(answers.shift());
+  };
+
+  const result = await runAgent({
+    client: clientFrom(Array(12).fill(respond)),
+    config: { ...baseConfig, max_turns: 8, max_tool_calls: 20, max_output_repair_attempts: 2 },
+    methodologies: [], prompt: "p", sandbox, schema,
+    validator: async (candidate) => candidate.answer === "good"
+      ? { ok: true }
+      : { ok: false, reason: "citation requires source verification" },
+  });
+
+  assert.equal(result.output, '{"answer":"good"}');
+  assert.equal(result.outputRepairCount, 2);
+  assert.equal(result.turnCount, 8);
+  // Three investigation turns, a tool-free finalization, then two tool-assisted repairs.
+  assert.deepEqual(activities, [
+    "tools", "tools", "tools", "answer", "tools", "answer", "tools", "answer",
+  ]);
 });
 
 test("runtime stops advertising tools after exhausting the configured budget", async () => {
@@ -234,8 +293,89 @@ test("runtime allows exactly one tools-disabled repair for JSON or schema failur
       config: baseConfig, methodologies: [], prompt: "p", sandbox, schema,
     }),
     (error) => error.reason ===
-      "repair response was invalid: response was not valid JSON" && error.turnCount === 2,
+      "output remained invalid after the repair limit: json: response was not valid JSON" &&
+      error.category === "output-invalid" &&
+      error.turnCount === 2 && error.outputRepairCount === 1,
   );
+});
+
+test("exhausting repairs reports the layer and reason that ended the stage", async () => {
+  const metrics = new RuntimeMetrics();
+  await assert.rejects(
+    runAgent({
+      client: clientFrom([
+        message("not-json"),
+        message(JSON.stringify({ answer: "x".repeat(2000) })),
+        message('{"wrong":true}'),
+      ]),
+      config: { ...baseConfig, max_output_bytes: 1024, max_output_repair_attempts: 2 },
+      methodologies: [], prompt: "p", sandbox, schema, metrics,
+    }),
+    (error) => error.reason ===
+      "output remained invalid after the repair limit: schema: response did not match the schema: #/required: required answer; #/additionalProperties: additionalProperties" &&
+      error.category === "output-invalid" && !error.retryable && error.outputRepairCount === 2,
+  );
+  assert.deepEqual(metrics.snapshot().outputRejections, [
+    { attempt: 1, activity: "investigating", layer: "json", reason: "response was not valid JSON" },
+    {
+      attempt: 2,
+      activity: "repairing",
+      layer: "size",
+      reason: "response exceeded the configured byte limit",
+    },
+    {
+      attempt: 3,
+      activity: "repairing",
+      layer: "schema",
+      reason: "response did not match the schema: #/required: required answer; #/additionalProperties: additionalProperties",
+    },
+  ]);
+});
+
+test("a semantic rejection is reported as its own validation layer", async () => {
+  const metrics = new RuntimeMetrics();
+  await assert.rejects(
+    runAgent({
+      client: clientFrom([message('{"answer":"a"}'), message('{"answer":"b"}')]),
+      config: { ...baseConfig, max_tool_calls: 0, max_output_repair_attempts: 1 },
+      methodologies: [], prompt: "p", sandbox, schema, metrics,
+      validator: async () => ({ ok: false, reason: "citation requires source verification" }),
+    }),
+    (error) => error.reason ===
+      "output remained invalid after the repair limit: semantic: citation requires source verification",
+  );
+  assert.deepEqual(
+    metrics.snapshot().outputRejections.map((rejection) => rejection.layer),
+    ["semantic", "semantic"],
+  );
+});
+
+test("clean runs report no rejection diagnostics", async () => {
+  const metrics = new RuntimeMetrics();
+  await runAgent({
+    client: clientFrom([message('{"answer":"done"}')]),
+    config: { ...baseConfig, max_tool_calls: 0 },
+    methodologies: [], prompt: "p", sandbox, schema, metrics,
+  });
+  assert.equal(Object.hasOwn(metrics.snapshot(), "outputRejections"), false);
+});
+
+test("rejection diagnostics are bounded and stripped of unexpected characters", async () => {
+  const metrics = new RuntimeMetrics();
+  const responses = Array.from({ length: 12 }, () => message("not-json"));
+  await assert.rejects(
+    runAgent({
+      client: clientFrom(responses),
+      config: { ...baseConfig, max_turns: 12, max_tool_calls: 0, max_output_repair_attempts: 10 },
+      methodologies: [], prompt: "p", sandbox, schema, metrics,
+    }),
+    (error) => error.category === "output-invalid",
+  );
+  assert.equal(metrics.snapshot().outputRejections.length, 8);
+
+  assert.equal(sanitizeReason("keeps a-z 0.9, (x): #/y_z"), "keeps a-z 0.9, (x): #/y_z");
+  assert.equal(sanitizeReason("drops\nnewlines\tand \"quotes\" <tags>"), "drops newlines and quotes tags");
+  assert.equal(sanitizeReason("x".repeat(400)).length, 240);
 });
 
 test("runtime rejects fenced repair output despite requesting JSON mode", async () => {
@@ -253,9 +393,255 @@ test("runtime rejects fenced repair output despite requesting JSON mode", async 
       schema,
     }),
     (error) => error.reason ===
-      "repair response was invalid: response was not valid JSON" && error.turnCount === 2,
+      "output remained invalid after the repair limit: json: response was not valid JSON" &&
+      error.category === "output-invalid" && error.turnCount === 2,
   );
   assert.deepEqual(requests[1].response_format, { type: "json_object" });
+});
+
+test("a tool-assisted repair still answers under the configured response format", async () => {
+  const requests = [];
+  const observed = [];
+  const validator = async (candidate, context) => {
+    observed.push({ candidate, ...context });
+    if (candidate.answer === "missing citation") {
+      return { ok: false, reason: "citation requires source verification" };
+    }
+    return { ok: true };
+  };
+  const result = await runAgent({
+    client: clientFrom([
+      message('{"answer":"missing citation"}'),
+      message(null, [call("citation", "read_file", { path: "evidence.txt" })]),
+      message('{"answer":"cited"}'),
+    ], requests),
+    config: { ...baseConfig, max_turns: 4, max_output_repair_attempts: 1 },
+    methodologies: [],
+    prompt: "p",
+    sandbox,
+    schema,
+    validator,
+  });
+
+  assert.equal(result.output, '{"answer":"cited"}');
+  assert.equal(result.outputRepairCount, 1);
+  assert.deepEqual(observed, [
+    {
+      candidate: { answer: "missing citation" },
+      previousCandidate: null,
+      candidates: [],
+      repairAttempt: 0,
+    },
+    {
+      candidate: { answer: "cited" },
+      previousCandidate: { answer: "missing citation" },
+      candidates: [{ answer: "missing citation" }],
+      repairAttempt: 1,
+    },
+  ]);
+  // Evidence lookup is offered once; once the tool results are in, the corrected value is requested
+  // without tools so it is produced under the response format instead of unconstrained.
+  assert.deepEqual(requests.map((request) => request.tools !== undefined), [true, true, false]);
+  assert.equal(requests[1].response_format, undefined);
+  assert.deepEqual(requests[2].response_format, { type: "json_object" });
+  assert.match(requests[1].messages.at(-1).content, /not to begin a new investigation/);
+  assert.equal(requests[2].messages.at(-1).role, "tool");
+});
+
+test("a repair that answers immediately is never offered a second tool turn", async () => {
+  const requests = [];
+  await assert.rejects(
+    runAgent({
+      client: clientFrom([
+        message('{"answer":"rejected"}'),
+        message(null, [call("first", "read_file", { path: "evidence.txt" })]),
+        message(null, [call("second", "read_file", { path: "evidence.txt" })]),
+      ], requests),
+      config: { ...baseConfig, max_turns: 4, max_output_repair_attempts: 1 },
+      methodologies: [],
+      prompt: "p",
+      sandbox,
+      schema,
+      validator: async () => ({ ok: false, reason: "citation requires source verification" }),
+    }),
+    (error) => error.reason === "repair response attempted a tool call" &&
+      error.category === "provider-response",
+  );
+  assert.deepEqual(requests.map((request) => request.tools !== undefined), [true, true, false]);
+});
+
+test("strict output constrains the answer a repair returns after evidence", async () => {
+  const requests = [];
+  const strictFormat = {
+    type: "json_schema",
+    json_schema: { name: "structured_output", strict: true, schema },
+  };
+  const result = await runAgent({
+    client: clientFrom([
+      message('{"answer":"missing citation"}'),
+      message(null, [call("citation", "read_file", { path: "evidence.txt" })]),
+      message('{"answer":"cited"}'),
+    ], requests),
+    config: {
+      ...baseConfig, max_turns: 4, max_output_repair_attempts: 1, output_format: "json_schema",
+    },
+    methodologies: [],
+    prompt: "p",
+    sandbox,
+    schema,
+    validator: async (candidate) => candidate.answer === "missing citation"
+      ? { ok: false, reason: "citation requires source verification" }
+      : { ok: true },
+  });
+
+  assert.equal(result.output, '{"answer":"cited"}');
+  // Constraining the turn that answers has to come out of the configured repair budget, not out of a
+  // correction the budget never accounted for.
+  assert.equal(result.outputRepairCount, 1);
+  assert.deepEqual(requests[2].response_format, strictFormat);
+});
+
+test("a repair that answers without evidence answers unconstrained but validated", async () => {
+  const requests = [];
+  const validated = [];
+  const result = await runAgent({
+    client: clientFrom([
+      message('{"answer":"missing citation"}'),
+      message('{"answer":"cited"}'),
+    ], requests),
+    config: {
+      ...baseConfig, max_turns: 4, max_output_repair_attempts: 1, output_format: "json_schema",
+    },
+    methodologies: [],
+    prompt: "p",
+    sandbox,
+    schema,
+    validator: async (candidate) => {
+      validated.push(candidate);
+      return candidate.answer === "missing citation"
+        ? { ok: false, reason: "citation requires source verification" }
+        : { ok: true };
+    },
+  });
+
+  // Offering tools is what costs the request its response format, so a repair that answers before
+  // looking anything up answers unconstrained. Nothing accepts it but the schema and the validator,
+  // which are what decide every result, constrained or not.
+  assert.equal(result.output, '{"answer":"cited"}');
+  assert.equal(requests[1].tools !== undefined, true);
+  assert.equal(requests[1].response_format, undefined);
+  assert.deepEqual(validated, [{ answer: "missing citation" }, { answer: "cited" }]);
+});
+
+test("validator sees every parsed candidate with the earliest still first", async () => {
+  const observed = [];
+  const reviewSchema = {
+    type: "object",
+    additionalProperties: false,
+    required: ["summary", "findings"],
+    properties: {
+      summary: { type: "string" },
+      findings: { type: "array" },
+    },
+  };
+  const result = await runAgent({
+    client: clientFrom([
+      message('{"summary":"original","findings":["preserve"],"unexpected":true}'),
+      message('{"findings":[]}'),
+      message('{"summary":"complete","findings":[]}'),
+    ]),
+    config: { ...baseConfig, max_turns: 4, max_tool_calls: 0, max_output_repair_attempts: 2 },
+    methodologies: [],
+    prompt: "p",
+    sandbox,
+    schema: reviewSchema,
+    validator: async (candidate, context) => {
+      observed.push({ candidate, ...context });
+      return { ok: true };
+    },
+  });
+
+  assert.equal(result.output, '{"summary":"complete","findings":[]}');
+  assert.deepEqual(observed, [{
+    candidate: { summary: "complete", findings: [] },
+    previousCandidate: { summary: "original", findings: ["preserve"], unexpected: true },
+    // A finding first added by an intermediate repair is only protectable if the validator is told
+    // that repair happened, so the whole ordered history travels with the baseline.
+    candidates: [
+      { summary: "original", findings: ["preserve"], unexpected: true },
+      { findings: [] },
+    ],
+    repairAttempt: 2,
+  }]);
+});
+
+test("validator retains falsy parsed candidates as repair baselines", async () => {
+  for (const [first, second, expected] of [
+    ["0", "false", 0],
+    ["false", "[]", false],
+    ["null", "[]", null],
+    ["[]", "false", []],
+  ]) {
+    const observed = [];
+    await runAgent({
+      client: clientFrom([
+        message("not JSON"),
+        message(first),
+        message(second),
+        message('{"answer":"complete"}'),
+      ]),
+      config: { ...baseConfig, max_turns: 5, max_tool_calls: 0, max_output_repair_attempts: 3 },
+      methodologies: [],
+      prompt: "p",
+      sandbox,
+      schema,
+      validator: async (candidate, context) => {
+        observed.push({ candidate, ...context });
+        return { ok: true };
+      },
+    });
+    assert.deepEqual(observed, [{
+      candidate: { answer: "complete" },
+      previousCandidate: expected,
+      candidates: [expected, JSON.parse(second)],
+      repairAttempt: 3,
+    }]);
+  }
+});
+
+test("validator execution failures are terminal and strict output is opt-in", async () => {
+  const terminal = new Error("validation context is stale");
+  terminal.code = "VALIDATOR_TERMINAL";
+  await assert.rejects(
+    runAgent({
+      client: clientFrom([message('{"answer":"candidate"}')]),
+      config: baseConfig,
+      methodologies: [],
+      prompt: "p",
+      sandbox,
+      schema,
+      validator: async () => { throw Object.assign(terminal, {
+        reason: "validation context is stale",
+        category: "validator-terminal",
+      }); },
+    }),
+    (error) => error.category === "validator-terminal" &&
+      error.reason === "validation context is stale" && error.outputRepairCount === 0,
+  );
+
+  const requests = [];
+  await runAgent({
+    client: clientFrom([message('{"answer":"candidate"}')], requests),
+    config: { ...baseConfig, max_tool_calls: 0, output_format: "json_schema" },
+    methodologies: [],
+    prompt: "p",
+    sandbox,
+    schema,
+  });
+  assert.deepEqual(requests[0].response_format, {
+    type: "json_schema",
+    json_schema: { name: "structured_output", strict: true, schema },
+  });
 });
 
 test("runtime repairs a final response with no text", async () => {
@@ -374,7 +760,9 @@ test("runtime does not request object-only JSON mode for non-object schemas", as
 test("provider errors are reduced to fixed non-sensitive categories", () => {
   assert.equal(providerFailureReason({ status: 401, message: "secret" }), "provider credential rejected");
   assert.equal(providerFailureReason({ status: 403, message: "secret" }), "provider access forbidden");
-  assert.equal(providerFailureReason({ status: 429, message: "secret" }), "provider rate or quota limit reached");
+  assert.equal(providerFailureReason({ status: 429, message: "secret" }), "provider rate limit reached");
+  assert.equal(providerFailureReason({ status: 408, message: "secret" }), "provider request timed out");
+  assert.equal(providerFailureReason({ status: 409, message: "secret" }), "provider request conflict");
   assert.equal(providerFailureReason({ status: 503, message: "secret" }), "provider service unavailable");
   assert.equal(
     providerFailureReason(new APIConnectionTimeoutError({ message: "secret" })),
@@ -397,6 +785,318 @@ test("provider errors are reduced to fixed non-sensitive categories", () => {
     "provider request failed",
   );
   assert.equal(providerFailureReason(new Error("secret")), "provider request failed");
+});
+
+test("real SDK classifies interrupted response bodies as recoverable connections", async () => {
+  const metrics = new RuntimeMetrics();
+  let calls = 0;
+  const client = createProviderClient(OpenAI, {
+    apiKey: "test-key",
+    baseURL: "https://provider.example/v1",
+    maxRetries: 0,
+    // The request timeout is far longer than the interruption so the classification under test is
+    // never decided by which timer a loaded machine happens to run first.
+    timeout: 30_000,
+  }, metrics, async () => {
+    calls++;
+    return new Response(new ReadableStream({
+      start(controller) {
+        setTimeout(() => {
+          controller.error(Object.assign(new TypeError("terminated"), {
+            cause: { code: "UND_ERR_SOCKET" },
+          }));
+        }, 40);
+      },
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  });
+
+  await assert.rejects(
+    runAgent({
+      client, config: baseConfig, methodologies: [], prompt: "p", sandbox, schema, metrics,
+    }),
+    (error) => error instanceof AgentFailure && error.category === "provider-connection" &&
+      error.retryable && error.turnCount === 1,
+  );
+
+  assert.equal(calls, 1);
+  assert.equal(metrics.snapshot().providerAttempts[0].durationMs >= 40, true);
+});
+
+test("real SDK retries interrupted response bodies within one retry budget", async () => {
+  const metrics = new RuntimeMetrics();
+  const delays = [];
+  let calls = 0;
+  const client = createProviderClient(OpenAI, {
+    apiKey: "test-key",
+    baseURL: "https://provider.example/v1",
+    maxRetries: 4,
+    timeout: 100,
+  }, metrics, async () => {
+    calls++;
+    if (calls === 5) {
+      return new Response(JSON.stringify({
+        choices: [{ finish_reason: "stop", message: { content: '{"answer":"done"}' } }],
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(new ReadableStream({
+      start(controller) {
+        queueMicrotask(() => controller.error(Object.assign(new TypeError("terminated"), {
+          cause: { code: "UND_ERR_SOCKET" },
+        })));
+      },
+    }), {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        "retry-after-ms": "0",
+      },
+    });
+  }, async (milliseconds) => { delays.push(milliseconds); });
+
+  const result = await runAgent({
+    client, config: baseConfig, methodologies: [], prompt: "p", sandbox, schema, metrics,
+  });
+
+  assert.equal(result.turnCount, 1);
+  assert.equal(calls, 5);
+  assert.deepEqual(delays, [0, 0, 0, 0]);
+  assert.equal(metrics.snapshot().requestRetryCount, 4);
+  assert.equal(metrics.snapshot().providerAttempts.length, 5);
+});
+
+test("real SDK shares retries between status and body failures", async () => {
+  const metrics = new RuntimeMetrics();
+  const delays = [];
+  let calls = 0;
+  const client = createProviderClient(OpenAI, {
+    apiKey: "test-key",
+    baseURL: "https://provider.example/v1",
+    maxRetries: 4,
+    timeout: 100,
+  }, metrics, async () => {
+    calls++;
+    if (calls === 1) {
+      return new Response("temporary failure", {
+        status: 503,
+        headers: {
+          "content-type": "application/json",
+          "retry-after-ms": "0",
+          "x-should-retry": "false",
+        },
+      });
+    }
+    if (calls === 2) {
+      return new Response(new ReadableStream({
+        start(controller) {
+          queueMicrotask(() => controller.error(Object.assign(new TypeError("terminated"), {
+            cause: { code: "UND_ERR_SOCKET" },
+          })));
+        },
+      }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "retry-after-ms": "0",
+        },
+      });
+    }
+    return new Response(JSON.stringify({
+      choices: [{ finish_reason: "stop", message: { content: '{"answer":"done"}' } }],
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }, async (milliseconds) => { delays.push(milliseconds); });
+
+  const result = await runAgent({
+    client, config: baseConfig, methodologies: [], prompt: "p", sandbox, schema, metrics,
+  });
+
+  assert.equal(result.turnCount, 1);
+  assert.equal(calls, 3);
+  assert.deepEqual(delays, [0, 0]);
+  assert.equal(metrics.snapshot().requestRetryCount, 2);
+  assert.deepEqual(
+    metrics.snapshot().providerAttempts.map((attempt) => attempt.status),
+    [503, 200, 200],
+  );
+});
+
+test("real SDK does not retry policy-terminal responses", async () => {
+  for (const [status, body, category] of [
+    [401, {}, "provider-credential"],
+    [403, {}, "provider-access"],
+    [400, {}, "provider-request"],
+    [429, { error: { code: "insufficient_quota" } }, "provider-quota"],
+  ]) {
+    const metrics = new RuntimeMetrics();
+    let calls = 0;
+    const client = createProviderClient(OpenAI, {
+      apiKey: "test-key",
+      baseURL: "https://provider.example/v1",
+      maxRetries: 4,
+      timeout: 100,
+    }, metrics, async () => {
+      calls++;
+      return new Response(JSON.stringify(body), {
+        status,
+        headers: {
+          "content-type": "application/json",
+          "retry-after-ms": "0",
+          "x-should-retry": "true",
+        },
+      });
+    }, async () => {
+      throw new Error("policy-terminal responses must not delay");
+    });
+
+    await assert.rejects(
+      runAgent({
+        client, config: baseConfig, methodologies: [], prompt: "p", sandbox, schema, metrics,
+      }),
+      (error) => error instanceof AgentFailure && error.category === category &&
+        !error.retryable && error.turnCount === 1,
+    );
+    assert.equal(calls, 1);
+    assert.equal(metrics.snapshot().requestRetryCount, 0);
+  }
+});
+
+test("real SDK retries transient responses despite negative provider hints", async () => {
+  for (const status of [408, 409, 429, 503]) {
+    const metrics = new RuntimeMetrics();
+    const delays = [];
+    let calls = 0;
+    const client = createProviderClient(OpenAI, {
+      apiKey: "test-key",
+      baseURL: "https://provider.example/v1",
+      maxRetries: 4,
+      timeout: 100,
+    }, metrics, async () => {
+      calls++;
+      if (calls === 1) {
+        return new Response(JSON.stringify({ error: { code: "temporarily_limited" } }), {
+          status,
+          headers: {
+            "content-type": "application/json",
+            "retry-after-ms": "0",
+            "x-should-retry": "false",
+          },
+        });
+      }
+      return new Response(JSON.stringify({
+        choices: [{ finish_reason: "stop", message: { content: '{"answer":"done"}' } }],
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }, async (milliseconds) => { delays.push(milliseconds); });
+
+    const result = await runAgent({
+      client, config: baseConfig, methodologies: [], prompt: "p", sandbox, schema, metrics,
+    });
+    assert.equal(result.turnCount, 1);
+    assert.equal(calls, 2);
+    assert.deepEqual(delays, [0]);
+    assert.equal(metrics.snapshot().requestRetryCount, 1);
+  }
+});
+
+test("real SDK finishes timeout attempts after response headers", async () => {
+  const metrics = new RuntimeMetrics();
+  let responseAdvanced = false;
+  const observeResponse = metrics.observeResponse.bind(metrics);
+  metrics.observeResponse = (...args) => {
+    observeResponse(...args);
+    queueMicrotask(() => { responseAdvanced = true; });
+  };
+  const finishAttempt = metrics.finishAttempt.bind(metrics);
+  metrics.finishAttempt = (attempt) => {
+    assert.equal(responseAdvanced, true);
+    finishAttempt(attempt);
+  };
+  let calls = 0;
+  const client = createProviderClient(OpenAI, {
+    apiKey: "test-key",
+    baseURL: "https://provider.example/v1",
+    maxRetries: 0,
+    timeout: 20,
+  }, metrics, async (_url, options) => {
+    calls++;
+    // The body only ever ends because the request timeout aborts it, so the outcome under test does
+    // not depend on a body timer losing a race against the timeout on a loaded machine.
+    return new Response(new ReadableStream({
+      start(controller) {
+        options.signal.addEventListener("abort", () => controller.error(options.signal.reason));
+      },
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  });
+
+  await assert.rejects(
+    runAgent({
+      client, config: baseConfig, methodologies: [], prompt: "p", sandbox, schema, metrics,
+    }),
+    (error) => error instanceof AgentFailure && error.category === "provider-timeout" &&
+      error.retryable && error.turnCount === 1,
+  );
+
+  assert.equal(calls, 1);
+  assert.equal(metrics.snapshot().providerAttempts[0].durationMs >= 0, true);
+});
+
+test("real SDK bounds stalled non-success response bodies", async () => {
+  for (const [status, category, retryable] of [
+    [503, "provider-service", true],
+    [429, "provider-rate-limit", true],
+    [401, "provider-credential", false],
+  ]) {
+    const metrics = new RuntimeMetrics();
+    let calls = 0;
+    const client = createProviderClient(OpenAI, {
+      apiKey: "test-key",
+      baseURL: "https://provider.example/v1",
+      maxRetries: 0,
+      timeout: 25,
+    }, metrics, async (_url, options) => {
+      calls++;
+      return new Response(new ReadableStream({
+        start(controller) {
+          options.signal.addEventListener("abort", () => controller.error(options.signal.reason));
+        },
+      }), {
+        status,
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    const started = Date.now();
+    await assert.rejects(
+      runAgent({
+        client, config: baseConfig, methodologies: [], prompt: "p", sandbox, schema, metrics,
+      }),
+      (error) => error instanceof AgentFailure && error.category === category &&
+        error.retryable === retryable && error.turnCount === 1,
+    );
+    // The SDK arms the request timeout before it calls fetch, so the attempt clock starts fractionally
+    // after the deadline it is measured against and can report just under it. Assert the timeout on
+    // this enclosing clock, which cannot start late, and require the attempt to fall inside it.
+    const elapsed = Date.now() - started;
+    assert.equal(elapsed >= 25, true);
+    assert.equal(elapsed < 200, true);
+    assert.equal(calls, 1);
+    const attempt = metrics.snapshot().providerAttempts[0];
+    assert.equal(attempt.status, status);
+    assert.equal(attempt.durationMs > 0 && attempt.durationMs <= elapsed, true);
+  }
 });
 
 test("provider diagnostics expose only bounded status and request IDs", () => {
@@ -428,4 +1128,22 @@ test("provider diagnostics expose only bounded status and request IDs", () => {
 test("executeTool bounds oversized argument strings", () => {
   const result = executeTool(call("large", "read_file", "x".repeat(16 * 1024 + 1)), sandbox);
   assert.match(result, /tool arguments exceed byte limit/);
+});
+
+test("repair failures retain the completed output repair count", async () => {
+  await assert.rejects(
+    runAgent({
+      client: clientFrom([
+        message('{"wrong":true}'),
+        message({ unexpected: true }),
+      ]),
+      config: baseConfig,
+      methodologies: [],
+      prompt: "p",
+      sandbox,
+      schema,
+    }),
+    (error) => error.reason === "provider response did not contain text" &&
+      error.outputRepairCount === 1,
+  );
 });

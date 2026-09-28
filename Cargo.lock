@@ -2664,6 +2664,7 @@ dependencies = [
  "ironrdp-core 0.2.1",
  "ironrdp-pdu",
  "ironrdp-svc",
+ "rand 0.9.4",
  "tracing",
 ]
 
@@ -3023,6 +3024,7 @@ dependencies = [
  "ironrdp-pdu",
  "openh264",
  "tracing",
+ "yuv",
 ]
 
 [[package]]
@@ -3389,6 +3391,7 @@ dependencies = [
  "ironrdp-nscodec",
  "ironrdp-pdu",
  "ironrdp-rdpdr",
+ "ironrdp-rdpeai",
  "ironrdp-rdpei",
  "ironrdp-rdpeusb",
  "ironrdp-rdpsnd",

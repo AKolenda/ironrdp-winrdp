@@ -19,6 +19,7 @@ pub mod heartbeat;
 #[cfg(feature = "helper")]
 mod helper;
 mod rdpdr;
+mod rdpeai;
 mod rdpei;
 mod server;
 mod sound;
@@ -43,6 +44,7 @@ pub use ironrdp_pdu::rdp::session_info::ServerAutoReconnect;
 #[cfg(feature = "usb")]
 pub use ironrdp_rdpeusb::io::{CompletionData, DeviceAnnounce, DeviceText, InternalIoControlPacket};
 pub use rdpdr::{NoopRdpdrServerBackend, RdpdrServerBackend, RdpdrServerFactory, RdpdrServerMessage};
+pub use rdpeai::{NoopRdpeaiServerBackend, RdpeaiServerBackend, RdpeaiServerFactory, RdpeaiServerMessage};
 pub use rdpei::{
     CsReadyFlags, CsReadyPdu, DismissHoveringTouchContactPdu, PenContact, PenContactDataFlags, PenContactFields,
     PenContactFlags, PenEventPdu, PenFlags, PenFrame, RdpInputProtocolVersion, RdpeiHandler, RdpeiServer,
@@ -50,10 +52,10 @@ pub use rdpei::{
     TouchEventPdu, TouchFrame,
 };
 pub use server::{
-    AutoReconnectCookieHandle, ConnectionHandler, ConnectionInfo, CredentialDecision, CredentialValidationError,
-    CredentialValidator, Credentials, ErrorInfoDisconnectHandle, ExactMatchCredentialValidator, PostConnectionAction,
-    RdpServer, RdpServerOptions, RdpServerSecurity, ServerEvent, ServerEventSender, StaticChannelFactory, TransportTls,
-    pick_remotefx_entropy_coder,
+    AutoReconnectCookieHandle, ConnectionHandler, ConnectionInfo, ConnectionPolicy, CredentialDecision,
+    CredentialValidationError, CredentialValidator, Credentials, ErrorInfoDisconnectHandle,
+    ExactMatchCredentialValidator, PostConnectionAction, RdpServer, RdpServerOptions, RdpServerSecurity, ServerEvent,
+    ServerEventSender, StaticChannelFactory, TransportTls, pick_remotefx_entropy_coder,
 };
 pub use sound::{RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory};
 #[cfg(feature = "usb")]

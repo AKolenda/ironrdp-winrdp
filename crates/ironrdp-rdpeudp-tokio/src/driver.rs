@@ -341,7 +341,7 @@ impl Driver {
                         if let Ok(mut shared) = self.shared.lock() {
                             shared.negotiated_version = version;
                         }
-                        tracing::info!(version, "RDP-UDP handshake complete");
+                        tracing::info!(?version, "RDP-UDP handshake complete");
                         self.connected_notify.notify_one();
                     }
                 }

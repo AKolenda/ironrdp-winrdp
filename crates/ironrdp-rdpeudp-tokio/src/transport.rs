@@ -323,9 +323,9 @@ impl UdpTransport {
         }
     }
 
-    /// The RDP-UDP protocol version the handshake settled on: 1 or 2 for the
-    /// MS-RDPEUDP data transfer, 3 for MS-RDPEUDP2.
-    pub fn negotiated_version(&self) -> Option<u16> {
+    /// The RDP-UDP version the handshake settled on: version 1 or 2 for MS-RDPEUDP,
+    /// version 3 for MS-RDPEUDP2.
+    pub fn negotiated_version(&self) -> Option<ironrdp_rdpeudp::pdu::UdpVersion> {
         self.shared.lock().ok().and_then(|shared| shared.negotiated_version)
     }
 
@@ -424,8 +424,8 @@ pub async fn connect_udp(config: UdpTransportConfig) -> Result<UdpTransport, Udp
 
     let mut connection_config = config.connection_config;
     connection_config.cookie_hash = Some(cookie_hash(&config.tunnel_config));
-    // Evaluation switch: IRONRDP_UDP_OFFER=1|2 asks for the MS-RDPEUDP framing
-    // directly instead of the version 3 (MS-RDPEUDP2) default.
+    // WinRDP: IRONRDP_UDP_OFFER=1|2|3 overrides the offered RDP-UDP version, so the
+    // launcher can pick it without a client configuration option.
     if let Some(offer) = std::env::var("IRONRDP_UDP_OFFER")
         .ok()
         .and_then(|v| v.parse::<u16>().ok())
@@ -507,11 +507,11 @@ pub async fn connect_udp(config: UdpTransportConfig) -> Result<UdpTransport, Udp
     // Phase 5: Set up data channels and spawn the read pump
     let (incoming_tx, incoming_rx) = mpsc::channel::<Vec<u8>>(64);
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<crate::tunnel::Outgoing>(64);
-    let responder_tx = outgoing_tx.clone();
+    let auto_detect_tx = outgoing_tx.clone();
 
     // Read pump: TLS → RDPEMT decode → channel
     let pump_handle = AbortOnDrop::new(tokio::spawn(async move {
-        tunnel_data_loop(&mut tls_read, &mut tunnel, &incoming_tx, &responder_tx).await
+        tunnel_data_loop(&mut tls_read, &mut tunnel, &incoming_tx, &auto_detect_tx).await
     }));
 
     // Write pump: channel → RDPEMT encode → TLS
@@ -686,10 +686,10 @@ async fn accept_udp_inner(socket: UdpSocket, config: UdpAcceptConfig) -> Result<
     // Phase 6: Set up data channels and spawn pumps (identical to client side)
     let (incoming_tx, incoming_rx) = mpsc::channel::<Vec<u8>>(64);
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<crate::tunnel::Outgoing>(64);
-    let responder_tx = outgoing_tx.clone();
+    let auto_detect_tx = outgoing_tx.clone();
 
     let pump_handle = AbortOnDrop::new(tokio::spawn(async move {
-        tunnel_data_loop(&mut tls_read, &mut tunnel, &incoming_tx, &responder_tx).await
+        tunnel_data_loop(&mut tls_read, &mut tunnel, &incoming_tx, &auto_detect_tx).await
     }));
 
     // Write pump: channel → RDPEMT encode → TLS

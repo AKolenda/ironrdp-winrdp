@@ -628,6 +628,9 @@ impl RpcApp {
                 info!(reliable_udp, udp_version, "Session transport");
             }
             RdpOutputEvent::WindowingOrders(_) => {}
+            // Only produced when the client is built with `.with_desktop_updates()`, which the
+            // viewer does not opt into: it always presents full-frame `Image` snapshots instead.
+            RdpOutputEvent::DesktopUpdate(_) => {}
         }
     }
 }

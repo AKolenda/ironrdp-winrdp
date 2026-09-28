@@ -17,10 +17,6 @@ const MAX_ZERO_RUN: usize = 4096;
 /// Errors encountered while decoding or encoding an SRL stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SrlError {
-    /// The required trailing zero byte is absent.
-    MissingTerminator,
-    /// The stream ended before a complete code word was read.
-    Truncated,
     /// An SRL value requires between one and fifteen magnitude bits.
     InvalidBitCount(u8),
     /// A value cannot be represented by the magnitude width.
@@ -35,8 +31,6 @@ pub enum SrlError {
 impl core::fmt::Display for SrlError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::MissingTerminator => write!(f, "srl stream is missing its trailing zero byte"),
-            Self::Truncated => write!(f, "srl stream is truncated"),
             Self::InvalidBitCount(bits) => write!(f, "invalid srl magnitude bit count {bits}"),
             Self::MagnitudeOutOfRange { magnitude, max } => {
                 write!(f, "srl magnitude {magnitude} exceeds maximum {max}")
@@ -108,10 +102,9 @@ impl<'a> SrlDecoder<'a> {
                 continue;
             }
 
-            let exhausted_before = self.reader.is_exhausted();
             self.zero_run_remaining = self.decode_zero_run()?;
             // A run cut short by the end of the stream is not followed by a non-zero entry.
-            self.nonzero_pending = !exhausted_before && !self.reader.is_exhausted();
+            self.nonzero_pending = !self.reader.is_exhausted();
         }
 
         Ok(output)

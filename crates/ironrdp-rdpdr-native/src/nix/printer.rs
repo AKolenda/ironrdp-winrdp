@@ -4,20 +4,20 @@
 //! The channel announces one virtual printer to the server (MS-RDPEPC). When
 //! the user prints to it, the server-side PostScript driver renders the job and
 //! pushes the bytes down as a create / write... / close sequence on that
-//! device. The job is spooled to a file while it streams; on close it is
-//! handed to `lp`, or written to a file in the user's downloads folder when
-//! there is no printer to hand it to.
-//!
-//! Spool files live in a private (0700) directory created per spooler, under
-//! `$XDG_RUNTIME_DIR` when it is set, so a document being printed is never
-//! readable by, or redirectable through, another local account.
+//! device. The job is spooled to a temporary file while it streams. On close,
+//! a worker thread hands it to `lp` or saves it in the configured folder, so a
+//! slow print system never stalls the channel. When `lp` is missing or cannot
+//! take the job, it is saved in the user's downloads folder instead.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use ironrdp_pdu::PduResult;
 use ironrdp_rdpdr::pdu::RdpdrPdu;
@@ -26,8 +26,17 @@ use ironrdp_rdpdr::pdu::efs::{
     NtStatus, PrinterIoRequest,
 };
 use ironrdp_svc::SvcMessage;
-use nix::unistd::mkdtemp;
 use tracing::{debug, info, warn};
+
+/// Most print jobs the printer keeps open at once, counting abandoned jobs that
+/// still wait for their close.
+const MAX_OPEN_PRINT_JOBS: usize = 16;
+/// Largest print job the printer accepts, in bytes.
+const MAX_PRINT_JOB_BYTES: u64 = 128 * 1024 * 1024;
+/// Closed jobs that may wait for the submission thread.
+const SUBMISSION_QUEUE_CAPACITY: usize = 16;
+/// How long `lp` may take to accept a job before it is killed.
+const LP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Where a finished job goes.
 #[derive(Debug, Clone)]
@@ -36,7 +45,7 @@ pub enum PrintTarget {
     DefaultPrinter,
     /// A named CUPS destination.
     Printer(String),
-    /// A directory: each job becomes `Win RDP print <timestamp>.ps` inside it.
+    /// A directory: each job becomes `RDP print <timestamp>.ps` inside it.
     Folder(PathBuf),
 }
 
@@ -48,20 +57,38 @@ struct Job {
     bytes: u64,
 }
 
+/// A closed job waiting for the submission thread.
+#[derive(Debug)]
+struct FinishedJob {
+    spool: PathBuf,
+    bytes: u64,
+}
+
+/// The thread that submits closed jobs, one at a time.
+#[derive(Debug)]
+struct Submitter {
+    jobs: SyncSender<FinishedJob>,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tests join the thread; a session leaves it to finish the queue")
+    )]
+    thread: JoinHandle<()>,
+}
+
 /// Print-job state for one virtual printer.
 #[derive(Debug)]
 pub struct PrinterSpooler {
     target: PrintTarget,
-    /// Fallback when `lp` is missing or refuses the job.
+    /// Where a job goes when `lp` is missing or cannot take it.
     fallback_dir: PathBuf,
-    /// Private directory holding the spool files, created with the first job
-    /// and removed, with anything left in it, when the spooler is dropped.
+    /// Private, atomically created 0700 directory, allocated on the first print job.
     spool_dir: Option<PathBuf>,
     next_file_id: u32,
     jobs: HashMap<u32, Job>,
-    /// Handles whose job was abandoned after an oversized write; a later close
-    /// must not submit whatever was spooled before.
-    poisoned: HashMap<u32, PathBuf>,
+    /// Handles whose job was abandoned; their close must not submit anything.
+    abandoned: HashSet<u32>,
+    /// Started on the first closed job.
+    submitter: Option<Submitter>,
 }
 
 impl PrinterSpooler {
@@ -72,224 +99,259 @@ impl PrinterSpooler {
             spool_dir: None,
             next_file_id: 1,
             jobs: HashMap::new(),
-            poisoned: HashMap::new(),
+            abandoned: HashSet::new(),
+            submitter: None,
         }
-    }
-
-    #[cfg(test)]
-    fn with_fallback_dir(mut self, dir: PathBuf) -> Self {
-        self.fallback_dir = dir;
-        self
     }
 
     pub fn handle(&mut self, req: PrinterIoRequest) -> PduResult<Vec<SvcMessage>> {
-        match req {
-            PrinterIoRequest::Create(create) => {
-                let file_id = self.next_file_id;
-                self.next_file_id = self.next_file_id.wrapping_add(1).max(1);
-                let response = match self.create_spool_file(file_id) {
-                    Ok((spool, file)) => {
-                        debug!(file_id, ?spool, "Print job opened");
-                        self.jobs.insert(file_id, Job { spool, file, bytes: 0 });
-                        DeviceCreateResponse {
-                            device_io_reply: DeviceIoResponse::new(create.device_io_request, NtStatus::SUCCESS),
-                            file_id,
-                            information: Information::FILE_OPENED,
-                        }
-                    }
-                    Err(error) => {
-                        warn!(%error, "Could not open a spool file for a print job");
-                        DeviceCreateResponse {
-                            device_io_reply: DeviceIoResponse::new(create.device_io_request, NtStatus::UNSUCCESSFUL),
-                            file_id: 0,
-                            information: Information::FILE_OPENED,
-                        }
-                    }
-                };
-                Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCreateResponse(response))])
-            }
-            PrinterIoRequest::Write(write) => {
-                let file_id = write.device_io_request.file_id;
-                let length = u32::try_from(write.write_data.len()).unwrap_or(u32::MAX);
-                let status = match self.jobs.get_mut(&file_id) {
-                    Some(job) => match job.file.write_all(&write.write_data) {
-                        Ok(()) => {
-                            job.bytes = job.bytes.saturating_add(u64::from(length));
-                            NtStatus::SUCCESS
-                        }
-                        Err(error) => {
-                            warn!(%error, file_id, "Could not spool print data");
-                            NtStatus::UNSUCCESSFUL
-                        }
-                    },
-                    None => NtStatus::UNSUCCESSFUL,
-                };
-                Ok(vec![SvcMessage::from(RdpdrPdu::DeviceWriteResponse(
-                    DeviceWriteResponse {
-                        device_io_reply: DeviceIoResponse::new(write.device_io_request, status),
-                        length,
-                    },
-                ))])
-            }
-            PrinterIoRequest::Close(close) => {
-                let file_id = close.device_io_request.file_id;
-                if let Some(spool) = self.poisoned.remove(&file_id) {
-                    let _ = std::fs::remove_file(spool);
-                } else if let Some(job) = self.jobs.remove(&file_id) {
-                    drop(job.file);
-                    self.submit(&job.spool, job.bytes);
-                }
-                Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCloseResponse(
-                    DeviceCloseResponse {
-                        device_io_response: DeviceIoResponse::new(close.device_io_request, NtStatus::SUCCESS),
-                    },
-                ))])
-            }
-        }
+        let response = match req {
+            PrinterIoRequest::Create(create) => self.create(create.device_io_request),
+            PrinterIoRequest::Write(write) => self.write(write.device_io_request, &write.write_data),
+            PrinterIoRequest::Close(close) => self.close(close.device_io_request),
+        };
+        Ok(vec![SvcMessage::from(response)])
     }
 
     /// Abandons the job behind an oversized write so a later close discards it.
     pub fn reject_write(&mut self, req: DeviceIoRequest) -> PduResult<Vec<SvcMessage>> {
-        if let Some(job) = self.jobs.remove(&req.file_id) {
+        if self.jobs.contains_key(&req.file_id) {
             warn!(
                 file_id = req.file_id,
                 "Print job abandoned: the server sent an oversized write"
             );
-            self.poisoned.insert(req.file_id, job.spool);
+            self.abandon(req.file_id);
         }
-        Ok(vec![SvcMessage::from(RdpdrPdu::DeviceWriteResponse(
-            DeviceWriteResponse {
-                device_io_reply: DeviceIoResponse::new(req, NtStatus::UNSUCCESSFUL),
-                length: 0,
-            },
-        ))])
+        Ok(vec![SvcMessage::from(write_response(req, 0, NtStatus::UNSUCCESSFUL))])
     }
 
-    /// Creates the spool file for a new job in this spooler's private directory.
-    fn create_spool_file(&mut self, file_id: u32) -> std::io::Result<(PathBuf, File)> {
-        let dir = match &mut self.spool_dir {
-            Some(dir) => dir,
-            slot @ None => {
-                let dir = create_spool_dir(
-                    std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
-                    std::env::temp_dir(),
-                )?;
-                debug!(?dir, "Print spool directory created");
-                slot.insert(dir)
+    /// Discards the open and abandoned jobs of the current RDPDR initialization sequence. Jobs
+    /// that were already closed are still submitted.
+    pub fn reset(&mut self) {
+        for (_, job) in self.jobs.drain() {
+            drop(job.file);
+            let _ = std::fs::remove_file(job.spool);
+        }
+        self.abandoned.clear();
+    }
+
+    fn create(&mut self, request: DeviceIoRequest) -> RdpdrPdu {
+        if self.jobs.len() + self.abandoned.len() >= MAX_OPEN_PRINT_JOBS {
+            warn!(limit = MAX_OPEN_PRINT_JOBS, "Print job refused: too many jobs are open");
+            return create_response(request, 0, NtStatus::UNSUCCESSFUL);
+        }
+        let file_id = self.next_file_id;
+        self.next_file_id = self.next_file_id.wrapping_add(1).max(1);
+        match self.open_spool(file_id) {
+            Ok(job) => {
+                debug!(file_id, spool = ?job.spool, "Print job opened");
+                self.jobs.insert(file_id, job);
+                create_response(request, file_id, NtStatus::SUCCESS)
             }
+            Err(error) => {
+                warn!(%error, "Could not open a spool file for a print job");
+                create_response(request, 0, NtStatus::UNSUCCESSFUL)
+            }
+        }
+    }
+
+    fn write(&mut self, request: DeviceIoRequest, data: &[u8]) -> RdpdrPdu {
+        let file_id = request.file_id;
+        let Some(job) = self.jobs.get_mut(&file_id) else {
+            return write_response(request, 0, NtStatus::UNSUCCESSFUL);
         };
-        let spool = dir.join(format!("job-{file_id}.ps"));
-        // `create_new` refuses anything already at the path, including a symbolic link.
+        let total = job.bytes.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
+        if total > MAX_PRINT_JOB_BYTES {
+            warn!(
+                file_id,
+                limit = MAX_PRINT_JOB_BYTES,
+                "Print job abandoned: it exceeds the size limit"
+            );
+            self.abandon(file_id);
+            return write_response(request, 0, NtStatus::UNSUCCESSFUL);
+        }
+        match job.file.write_all(data) {
+            Ok(()) => {
+                job.bytes = total;
+                let length = u32::try_from(data.len()).unwrap_or(u32::MAX);
+                write_response(request, length, NtStatus::SUCCESS)
+            }
+            Err(error) => {
+                warn!(%error, file_id, "Print job abandoned: could not spool its data");
+                self.abandon(file_id);
+                write_response(request, 0, NtStatus::UNSUCCESSFUL)
+            }
+        }
+    }
+
+    fn close(&mut self, request: DeviceIoRequest) -> RdpdrPdu {
+        let file_id = request.file_id;
+        if !self.abandoned.remove(&file_id)
+            && let Some(Job { spool, file, bytes }) = self.jobs.remove(&file_id)
+        {
+            drop(file);
+            if bytes == 0 {
+                debug!(?spool, "Empty print job discarded");
+                let _ = std::fs::remove_file(spool);
+            } else {
+                self.queue_submission(FinishedJob { spool, bytes });
+            }
+        }
+        close_response(request, NtStatus::SUCCESS)
+    }
+
+    /// Drops an open job's spool file so its close submits nothing, not even a partial document.
+    fn abandon(&mut self, file_id: u32) {
+        if let Some(job) = self.jobs.remove(&file_id) {
+            drop(job.file);
+            let _ = std::fs::remove_file(job.spool);
+            self.abandoned.insert(file_id);
+        }
+    }
+
+    fn queue_submission(&mut self, job: FinishedJob) {
+        if self.submitter.is_none() {
+            let Some(spool_dir) = self.spool_dir.clone() else {
+                return;
+            };
+            match Submitter::spawn(self.target.clone(), self.fallback_dir.clone(), spool_dir) {
+                Ok(submitter) => self.submitter = Some(submitter),
+                Err(error) => {
+                    warn!(%error, "Could not start the print submission thread; the print job is discarded");
+                    let _ = std::fs::remove_file(job.spool);
+                    return;
+                }
+            }
+        }
+        let Some(submitter) = &self.submitter else {
+            return;
+        };
+        if let Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) = submitter.jobs.try_send(job) {
+            warn!(spool = ?job.spool, "Could not queue the print job for submission; it is discarded");
+            let _ = std::fs::remove_file(job.spool);
+        }
+    }
+
+    fn open_spool(&mut self, file_id: u32) -> std::io::Result<Job> {
+        if self.spool_dir.is_none() {
+            // mkdtemp creates the directory exclusively with mode 0700; no shared
+            // pathname can be substituted between creation and opening a job.
+            let template = std::env::temp_dir().join("ironrdp-print-XXXXXX");
+            self.spool_dir = Some(nix::unistd::mkdtemp(&template)?);
+        }
+        let dir = self
+            .spool_dir
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("missing spool directory"))?;
+        let spool = dir.join(format!("{file_id}.ps"));
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&spool)?;
-        Ok((spool, file))
-    }
-
-    fn submit(&self, spool: &Path, bytes: u64) {
-        if bytes == 0 {
-            debug!(?spool, "Empty print job discarded");
-            let _ = std::fs::remove_file(spool);
-            return;
-        }
-        let mut command = Command::new("lp");
-        match &self.target {
-            PrintTarget::DefaultPrinter => {}
-            PrintTarget::Printer(name) => {
-                command.arg("-d").arg(name);
-            }
-            PrintTarget::Folder(dir) => {
-                self.keep(spool, dir);
-                return;
-            }
-        }
-        command.arg("-t").arg("Win RDP print job").arg(spool);
-        match command.output() {
-            Ok(output) if output.status.success() => {
-                info!(
-                    bytes,
-                    "Print job handed to lp: {}",
-                    String::from_utf8_lossy(&output.stdout).trim()
-                );
-                let _ = std::fs::remove_file(spool);
-            }
-            Ok(output) => {
-                warn!(
-                    "lp refused the print job ({}); keeping it as a file instead",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-                self.keep(spool, &self.fallback_dir.clone());
-            }
-            Err(error) => {
-                warn!(%error, "lp is not available; keeping the print job as a file instead");
-                self.keep(spool, &self.fallback_dir.clone());
-            }
-        }
-    }
-
-    /// Moves the spooled job into `dir` under a readable name.
-    fn keep(&self, spool: &Path, dir: &Path) {
-        if let Err(error) = std::fs::create_dir_all(dir) {
-            warn!(%error, ?dir, "Could not create the print output folder");
-            return;
-        }
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let mut destination = dir.join(format!("Win RDP print {stamp}.ps"));
-        let mut n = 1;
-        while destination.exists() {
-            destination = dir.join(format!("Win RDP print {stamp} ({n}).ps"));
-            n += 1;
-        }
-        let moved = std::fs::rename(spool, &destination).or_else(|_| {
-            // The spool directory is usually on another file system (tmpfs), so copy
-            // into a file this call creates rather than into whatever is at the path.
-            let mut saved = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&destination)?;
-            std::io::copy(&mut File::open(spool)?, &mut saved)?;
-            std::fs::remove_file(spool)
-        });
-        match moved {
-            Ok(()) => info!(?destination, "Print job saved as a PostScript file"),
-            Err(error) => warn!(%error, ?destination, "Could not save the print job"),
-        }
+        Ok(Job { spool, file, bytes: 0 })
     }
 }
 
 impl Drop for PrinterSpooler {
     fn drop(&mut self) {
-        // Takes jobs still streaming, and any that could be neither printed nor saved, with it.
-        if let Some(dir) = self.spool_dir.take()
-            && let Err(error) = std::fs::remove_dir_all(&dir)
+        // A disconnected session abandons its open jobs. Jobs it already closed are still
+        // submitted, and the submission thread removes the spool directory once it is done.
+        self.reset();
+        if self.submitter.take().is_none()
+            && let Some(dir) = self.spool_dir.take()
         {
-            warn!(%error, ?dir, "Could not remove the print spool directory");
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 }
 
-/// Creates a private (0700) spool directory with an unpredictable name.
-///
-/// `runtime_dir` (`$XDG_RUNTIME_DIR`) is preferred: it is private to the user and
-/// cleared at logout. A relative value is ignored, as the XDG Base Directory
-/// specification requires. `temp_dir` is the fallback; in a shared `/tmp`, the
-/// `mkdtemp` name and mode are what keep other local accounts out.
-fn create_spool_dir(runtime_dir: Option<PathBuf>, temp_dir: PathBuf) -> std::io::Result<PathBuf> {
-    const TEMPLATE: &str = "winrdp-print-XXXXXX";
-
-    if let Some(runtime_dir) = runtime_dir.filter(|dir| dir.is_absolute()) {
-        match mkdtemp(&runtime_dir.join(TEMPLATE)) {
-            Ok(dir) => return Ok(dir),
-            Err(error) => warn!(%error, ?runtime_dir, "Could not create the print spool in the runtime directory"),
-        }
+impl Submitter {
+    fn spawn(target: PrintTarget, fallback_dir: PathBuf, spool_dir: PathBuf) -> std::io::Result<Self> {
+        let (jobs, queue) = sync_channel(SUBMISSION_QUEUE_CAPACITY);
+        let thread = std::thread::Builder::new()
+            .name("ironrdp-print-submit".to_owned())
+            .spawn(move || submit_jobs(&target, &fallback_dir, &spool_dir, queue))?;
+        Ok(Self { jobs, thread })
     }
-    Ok(mkdtemp(&temp_dir.join(TEMPLATE))?)
+}
+
+/// Submits queued jobs until the spooler is gone, then removes the spool directory.
+fn submit_jobs(target: &PrintTarget, fallback_dir: &Path, spool_dir: &Path, queue: Receiver<FinishedJob>) {
+    for job in queue {
+        let printed = match target {
+            PrintTarget::DefaultPrinter => print(&job, None),
+            PrintTarget::Printer(name) => print(&job, Some(name)),
+            PrintTarget::Folder(dir) => {
+                save(&job.spool, dir);
+                true
+            }
+        };
+        if !printed {
+            save(&job.spool, fallback_dir);
+        }
+        let _ = std::fs::remove_file(&job.spool);
+    }
+    let _ = std::fs::remove_dir_all(spool_dir);
+}
+
+/// Hands the job to `lp`, killing it if it has not accepted the job within [`LP_TIMEOUT`].
+/// Returns whether `lp` accepted the job.
+fn print(job: &FinishedJob, destination: Option<&str>) -> bool {
+    let mut command = Command::new("lp");
+    if let Some(name) = destination {
+        command.arg("-d").arg(name);
+    }
+    command
+        .arg("-t")
+        .arg("RDP print job")
+        .arg(&job.spool)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            warn!(%error, "lp is not available; keeping the print job as a file instead");
+            return false;
+        }
+    };
+    let deadline = Instant::now() + LP_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                warn!(timeout = ?LP_TIMEOUT, "lp did not accept the print job in time; keeping it as a file instead");
+                return false;
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                warn!(%error, "Could not wait for lp; keeping the print job as a file instead");
+                return false;
+            }
+        }
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    if status.success() {
+        info!(bytes = job.bytes, "Print job handed to lp: {}", stdout.trim());
+    } else {
+        warn!(
+            "lp refused the print job ({}); keeping it as a file instead",
+            stderr.trim()
+        );
+    }
+    status.success()
 }
 
 fn default_fallback_dir() -> PathBuf {
@@ -301,7 +363,8 @@ fn default_fallback_dir() -> PathBuf {
 }
 
 impl PrintTarget {
-    /// Parses the launcher's setting: `default`, `folder:<dir>`, or a CUPS destination name.
+    /// Parses a target description: `default` (or an empty string), `folder:<dir>`, or a CUPS
+    /// destination name.
     pub fn parse(value: &str) -> Self {
         let value = value.trim();
         if value.is_empty() || value.eq_ignore_ascii_case("default") {
@@ -314,12 +377,94 @@ impl PrintTarget {
     }
 }
 
+/// Copies the spooled job into `dir` under a readable name.
+fn save(spool: &Path, dir: &Path) {
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        warn!(%error, ?dir, "Could not create the print output folder");
+        return;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // The destination may also be shared. Exclusive creation avoids overwriting
+    // existing documents or following a symlink, including across filesystems.
+    let mut n = 0u64;
+    let (destination, mut output) = loop {
+        let name = if n == 0 {
+            format!("RDP print {stamp}.ps")
+        } else {
+            format!("RDP print {stamp} ({n}).ps")
+        };
+        let destination = dir.join(name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&destination)
+        {
+            Ok(file) => break (destination, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => n = n.saturating_add(1),
+            Err(error) => {
+                warn!(%error, ?destination, "Could not create the print output file");
+                return;
+            }
+        }
+    };
+    let saved = File::open(spool)
+        .and_then(|mut input| std::io::copy(&mut input, &mut output))
+        .and_then(|_| output.flush());
+    match saved {
+        Ok(()) => info!(?destination, "Print job saved as a PostScript file"),
+        Err(error) => {
+            drop(output);
+            let _ = std::fs::remove_file(&destination);
+            warn!(%error, ?destination, "Could not save the print job");
+        }
+    }
+}
+
+/// Answers a printer request with `NOT_SUPPORTED`, in the response its major function expects.
+pub(crate) fn unsupported_response(request: PrinterIoRequest) -> RdpdrPdu {
+    match request {
+        PrinterIoRequest::Create(create) => create_response(create.device_io_request, 0, NtStatus::NOT_SUPPORTED),
+        PrinterIoRequest::Write(write) => write_response(write.device_io_request, 0, NtStatus::NOT_SUPPORTED),
+        PrinterIoRequest::Close(close) => close_response(close.device_io_request, NtStatus::NOT_SUPPORTED),
+    }
+}
+
+/// A failed create carries no file handle and no `FILE_OPENED`.
+fn create_response(request: DeviceIoRequest, file_id: u32, status: NtStatus) -> RdpdrPdu {
+    let opened = status == NtStatus::SUCCESS;
+    RdpdrPdu::DeviceCreateResponse(DeviceCreateResponse {
+        device_io_reply: DeviceIoResponse::new(request, status),
+        file_id: if opened { file_id } else { 0 },
+        information: if opened {
+            Information::FILE_OPENED
+        } else {
+            Information::empty()
+        },
+    })
+}
+
+/// `length` is the number of bytes written, so a failed write reports 0 (MS-RDPEPC 3.2.5.1.12).
+pub(crate) fn write_response(request: DeviceIoRequest, length: u32, status: NtStatus) -> RdpdrPdu {
+    RdpdrPdu::DeviceWriteResponse(DeviceWriteResponse {
+        device_io_reply: DeviceIoResponse::new(request, status),
+        length,
+    })
+}
+
+fn close_response(request: DeviceIoRequest, status: NtStatus) -> RdpdrPdu {
+    RdpdrPdu::DeviceCloseResponse(DeviceCloseResponse {
+        device_io_response: DeviceIoResponse::new(request, status),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use ironrdp_rdpdr::pdu::efs::{
-        CreateDisposition, CreateOptions, DesiredAccess, DeviceCloseRequest, DeviceCreateRequest, DeviceWriteRequest,
-        FileAttributes, MajorFunction, MinorFunction, SharedAccess,
-    };
+    use ironrdp_rdpdr::pdu::efs::{DeviceCloseRequest, DeviceWriteRequest, MajorFunction, MinorFunction};
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
 
     use super::*;
 
@@ -333,27 +478,38 @@ mod tests {
         }
     }
 
+    fn open_job(spooler: &mut PrinterSpooler) -> u32 {
+        let RdpdrPdu::DeviceCreateResponse(response) = spooler.create(io(0, MajorFunction::Create)) else {
+            panic!("expected a create response");
+        };
+        assert_eq!(response.information, Information::FILE_OPENED);
+        response.file_id
+    }
+
+    fn close_job(spooler: &mut PrinterSpooler, file_id: u32) {
+        spooler
+            .handle(PrinterIoRequest::Close(DeviceCloseRequest::decode(io(
+                file_id,
+                MajorFunction::Close,
+            ))))
+            .expect("close");
+    }
+
+    /// Stops the submission thread once it has handled every queued job.
+    fn wait_for_submissions(spooler: &mut PrinterSpooler) {
+        if let Some(Submitter { jobs, thread }) = spooler.submitter.take() {
+            drop(jobs);
+            thread.join().expect("submission thread");
+        }
+    }
+
     #[test]
     fn a_job_streams_into_the_folder_target() {
-        let dir = std::env::temp_dir().join(format!("winrdp-print-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ironrdp-print-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut spooler = PrinterSpooler::new(PrintTarget::Folder(dir.clone())).with_fallback_dir(dir.clone());
+        let mut spooler = PrinterSpooler::new(PrintTarget::Folder(dir.clone()));
 
-        let create = spooler
-            .handle(PrinterIoRequest::Create(DeviceCreateRequest {
-                device_io_request: io(0, MajorFunction::Create),
-                desired_access: DesiredAccess::empty(),
-                allocation_size: 0,
-                file_attributes: FileAttributes::empty(),
-                shared_access: SharedAccess::empty(),
-                create_disposition: CreateDisposition::FILE_OPEN,
-                create_options: CreateOptions::empty(),
-                path: String::new(),
-            }))
-            .expect("create");
-        assert_eq!(create.len(), 1);
-        let file_id = spooler.jobs.keys().copied().next().expect("one open job");
-
+        let file_id = open_job(&mut spooler);
         for chunk in [&b"%!PS-Adobe-3.0\n"[..], b"showpage\n"] {
             spooler
                 .handle(PrinterIoRequest::Write(DeviceWriteRequest {
@@ -363,15 +519,15 @@ mod tests {
                 }))
                 .expect("write");
         }
-        spooler
-            .handle(PrinterIoRequest::Close(DeviceCloseRequest::decode(io(
-                file_id,
-                MajorFunction::Close,
-            ))))
-            .expect("close");
+        close_job(&mut spooler, file_id);
+        wait_for_submissions(&mut spooler);
 
         let saved: Vec<_> = std::fs::read_dir(&dir).expect("dir").flatten().collect();
         assert_eq!(saved.len(), 1, "one job file");
+        assert_eq!(
+            saved[0].metadata().expect("saved job").permissions().mode() & 0o777,
+            0o600
+        );
         let content = std::fs::read_to_string(saved[0].path()).expect("content");
         assert_eq!(content, "%!PS-Adobe-3.0\nshowpage\n");
         assert!(spooler.jobs.is_empty());
@@ -380,126 +536,117 @@ mod tests {
 
     #[test]
     fn a_rejected_write_poisons_the_job_so_close_discards_it() {
-        let dir = std::env::temp_dir().join(format!("winrdp-print-test-poison-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ironrdp-print-test-poison-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut spooler = PrinterSpooler::new(PrintTarget::Folder(dir.clone())).with_fallback_dir(dir.clone());
-        spooler
-            .handle(PrinterIoRequest::Create(DeviceCreateRequest {
-                device_io_request: io(0, MajorFunction::Create),
-                desired_access: DesiredAccess::empty(),
-                allocation_size: 0,
-                file_attributes: FileAttributes::empty(),
-                shared_access: SharedAccess::empty(),
-                create_disposition: CreateDisposition::FILE_OPEN,
-                create_options: CreateOptions::empty(),
-                path: String::new(),
-            }))
-            .expect("create");
-        let file_id = spooler.jobs.keys().copied().next().expect("one open job");
+        let mut spooler = PrinterSpooler::new(PrintTarget::Folder(dir.clone()));
+        let file_id = open_job(&mut spooler);
         spooler.reject_write(io(file_id, MajorFunction::Write)).expect("reject");
-        spooler
-            .handle(PrinterIoRequest::Close(DeviceCloseRequest::decode(io(
-                file_id,
-                MajorFunction::Close,
-            ))))
-            .expect("close");
+        close_job(&mut spooler, file_id);
+        wait_for_submissions(&mut spooler);
         assert!(
             !dir.exists() || std::fs::read_dir(&dir).expect("dir").next().is_none(),
             "nothing saved"
         );
     }
 
-    /// Sends a create request; `true` when it opened a job.
-    fn open_job(spooler: &mut PrinterSpooler) -> bool {
-        let responses = spooler
-            .handle(PrinterIoRequest::Create(DeviceCreateRequest {
-                device_io_request: io(0, MajorFunction::Create),
-                desired_access: DesiredAccess::empty(),
-                allocation_size: 0,
-                file_attributes: FileAttributes::empty(),
-                shared_access: SharedAccess::empty(),
-                create_disposition: CreateDisposition::FILE_OPEN,
-                create_options: CreateOptions::empty(),
-                path: String::new(),
-            }))
-            .expect("create");
-        assert_eq!(responses.len(), 1);
-        !spooler.jobs.is_empty()
-    }
+    #[test]
+    fn a_job_over_the_size_limit_is_abandoned() {
+        let mut spooler = PrinterSpooler::new(PrintTarget::DefaultPrinter);
+        let file_id = open_job(&mut spooler);
+        let spool = spooler.jobs[&file_id].spool.clone();
+        spooler.jobs.get_mut(&file_id).expect("open job").bytes = MAX_PRINT_JOB_BYTES;
 
-    fn mode(path: &Path) -> u32 {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        std::fs::symlink_metadata(path).expect("metadata").permissions().mode() & 0o777
+        let RdpdrPdu::DeviceWriteResponse(response) = spooler.write(io(file_id, MajorFunction::Write), b"x") else {
+            panic!("expected a write response");
+        };
+        assert_eq!(response.length, 0, "a failed write reports no bytes written");
+        assert!(!spool.exists(), "the abandoned job's spool file is removed");
+        assert!(spooler.abandoned.contains(&file_id));
     }
 
     #[test]
-    fn a_job_is_spooled_privately_and_the_directory_goes_with_the_spooler() {
-        let out = mkdtemp(&std::env::temp_dir().join("winrdp-print-test-XXXXXX")).expect("scratch dir");
-        let mut spooler = PrinterSpooler::new(PrintTarget::Folder(out.clone())).with_fallback_dir(out.clone());
-        assert!(open_job(&mut spooler));
+    fn failed_requests_carry_no_handle_or_length() {
+        let mut spooler = PrinterSpooler::new(PrintTarget::DefaultPrinter);
+        for _ in 0..MAX_OPEN_PRINT_JOBS {
+            open_job(&mut spooler);
+        }
+        let RdpdrPdu::DeviceCreateResponse(response) = spooler.create(io(0, MajorFunction::Create)) else {
+            panic!("expected a create response");
+        };
+        assert_eq!(response.file_id, 0);
+        assert_eq!(response.information, Information::empty());
 
-        let spool = spooler.jobs.values().next().expect("one open job").spool.clone();
-        let dir = spooler.spool_dir.clone().expect("spool directory");
-        assert_eq!(spool.parent(), Some(dir.as_path()));
-        assert_eq!(mode(&dir), 0o700);
-        assert_eq!(mode(&spool), 0o600);
-        let name = dir.file_name().and_then(|name| name.to_str()).expect("name");
-        assert!(name.starts_with("winrdp-print-") && !name.ends_with("XXXXXX"), "{name}");
-
-        drop(spooler);
-        assert!(!dir.exists(), "the spool directory is removed with the spooler");
-        let _ = std::fs::remove_dir_all(&out);
+        let RdpdrPdu::DeviceWriteResponse(response) = spooler.write(io(u32::MAX, MajorFunction::Write), b"data") else {
+            panic!("expected a write response");
+        };
+        assert_eq!(response.length, 0);
     }
 
     #[test]
-    fn a_spool_file_is_never_opened_through_something_already_at_its_path() {
-        let scratch = mkdtemp(&std::env::temp_dir().join("winrdp-print-test-XXXXXX")).expect("scratch dir");
-        let victim = scratch.join("victim");
-        std::fs::write(&victim, b"untouched").expect("victim");
-        let dir = scratch.join("spool");
-        std::fs::create_dir(&dir).expect("spool dir");
-        std::os::unix::fs::symlink(&victim, dir.join("job-1.ps")).expect("symlink");
-
-        let mut spooler = PrinterSpooler::new(PrintTarget::Folder(scratch.clone()));
-        spooler.spool_dir = Some(dir.clone());
-        assert!(!open_job(&mut spooler), "the create is refused");
-        assert_eq!(std::fs::read(&victim).expect("victim"), b"untouched");
-
-        drop(spooler);
-        let _ = std::fs::remove_dir_all(&scratch);
+    fn unsupported_requests_are_answered_with_their_own_response_type() {
+        let write = unsupported_response(PrinterIoRequest::Write(DeviceWriteRequest {
+            device_io_request: io(1, MajorFunction::Write),
+            offset: 0,
+            write_data: b"data".to_vec(),
+        }));
+        let RdpdrPdu::DeviceWriteResponse(response) = write else {
+            panic!("expected a write response");
+        };
+        assert_eq!(response.length, 0);
     }
 
     #[test]
-    fn the_spool_directory_prefers_an_absolute_runtime_dir() {
-        let scratch = mkdtemp(&std::env::temp_dir().join("winrdp-print-test-XXXXXX")).expect("scratch dir");
-        let runtime = scratch.join("runtime");
-        let temp = scratch.join("temp");
-        std::fs::create_dir(&runtime).expect("runtime");
-        std::fs::create_dir(&temp).expect("temp");
-
-        let dir = create_spool_dir(Some(runtime.clone()), temp.clone()).expect("runtime spool dir");
-        assert_eq!(dir.parent(), Some(runtime.as_path()));
-        assert_eq!(mode(&dir), 0o700);
-
-        let dir = create_spool_dir(None, temp.clone()).expect("unset");
-        assert_eq!(dir.parent(), Some(temp.as_path()));
-        assert_eq!(mode(&dir), 0o700);
-
-        let dir = create_spool_dir(Some(PathBuf::from("relative")), temp.clone()).expect("relative");
-        assert_eq!(dir.parent(), Some(temp.as_path()));
-
-        let dir = create_spool_dir(Some(scratch.join("missing")), temp.clone()).expect("missing");
-        assert_eq!(dir.parent(), Some(temp.as_path()));
-
-        let _ = std::fs::remove_dir_all(&scratch);
-    }
-
-    #[test]
-    fn targets_parse_from_the_launcher_setting() {
+    fn targets_parse_from_a_description() {
         assert!(matches!(PrintTarget::parse("default"), PrintTarget::DefaultPrinter));
         assert!(matches!(PrintTarget::parse(""), PrintTarget::DefaultPrinter));
         assert!(matches!(PrintTarget::parse("HP_LaserJet"), PrintTarget::Printer(n) if n == "HP_LaserJet"));
         assert!(matches!(PrintTarget::parse("folder:/tmp/out"), PrintTarget::Folder(p) if p == Path::new("/tmp/out")));
+    }
+
+    #[test]
+    fn reset_discards_open_jobs() {
+        let mut spooler = PrinterSpooler::new(PrintTarget::DefaultPrinter);
+        let open = open_job(&mut spooler);
+        let spool = spooler.jobs[&open].spool.clone();
+        let abandoned = open_job(&mut spooler);
+        spooler
+            .reject_write(io(abandoned, MajorFunction::Write))
+            .expect("reject");
+
+        spooler.reset();
+        assert!(spooler.jobs.is_empty());
+        assert!(spooler.abandoned.is_empty());
+        assert!(!spool.exists(), "the open job's spool file is removed");
+    }
+
+    #[test]
+    fn spool_files_are_private_and_removed_when_the_session_ends() {
+        let mut spooler = PrinterSpooler::new(PrintTarget::DefaultPrinter);
+        let mut job = spooler.open_spool(1).expect("private job");
+        let dir = job.spool.parent().expect("spool directory").to_path_buf();
+        assert_eq!(
+            std::fs::metadata(&dir).expect("directory").permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(job.file.metadata().expect("job").permissions().mode() & 0o777, 0o600);
+        job.file.write_all(b"private document").expect("write");
+        spooler.jobs.insert(1, job);
+        drop(spooler);
+        assert!(!dir.exists(), "disconnection removes unfinished documents");
+    }
+
+    #[test]
+    fn an_existing_spool_symlink_is_never_followed() {
+        let mut spooler = PrinterSpooler::new(PrintTarget::DefaultPrinter);
+        let job = spooler.open_spool(1).expect("allocate directory");
+        let dir = job.spool.parent().expect("directory");
+        let target = dir.join("existing-document");
+        std::fs::write(&target, b"keep this").expect("target");
+        symlink(&target, dir.join("2.ps")).expect("symlink");
+        assert_eq!(
+            spooler.open_spool(2).expect_err("collision must fail").kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&target).expect("unchanged target"), b"keep this");
     }
 }

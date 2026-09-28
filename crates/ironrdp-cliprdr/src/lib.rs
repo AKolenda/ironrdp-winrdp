@@ -129,11 +129,10 @@ pub(crate) fn is_absolute_path(filename: &str) -> bool {
     // Both reveal drive information and should be blocked
     if filename.len() >= 2 {
         let mut chars = filename.chars();
-        if let (Some(first), Some(second)) = (chars.next(), chars.next())
-            && first.is_ascii_alphabetic()
-            && second == ':'
-        {
-            return true;
+        if let (Some(first), Some(second)) = (chars.next(), chars.next()) {
+            if first.is_ascii_alphabetic() && second == ':' {
+                return true;
+            }
         }
     }
 
@@ -321,12 +320,10 @@ fn strip_absolute_prefix<'a>(components: &'a [&str]) -> &'a [&'a str] {
         // Long path prefix: \\?\C:\path or \\.\device\path
         // Skip the prefix marker and any following drive letter.
         let rest = &components[1..];
-        if let Some(second) = rest.first()
-            && second.len() == 2
-            && second.as_bytes()[0].is_ascii_alphabetic()
-            && second.as_bytes()[1] == b':'
-        {
-            return &rest[1..];
+        if let Some(second) = rest.first() {
+            if second.len() == 2 && second.as_bytes()[0].is_ascii_alphabetic() && second.as_bytes()[1] == b':' {
+                return &rest[1..];
+            }
         }
         return rest;
     }
@@ -370,6 +367,31 @@ const MAX_OUTGOING_LOCKS: usize = 100;
 /// removed when the corresponding [`FileContentsResponse`] arrives. This limit
 /// prevents unbounded growth if responses are never received.
 const MAX_PENDING_FILE_REQUESTS: usize = 1000;
+
+/// Fails one file contents request without leaving its caller waiting.
+///
+/// A rejected request is a per-request failure, not a channel failure. The
+/// backend is notified with an error response so it can release whatever is
+/// waiting on that stream id -- the same treatment `FormatListResponse::Fail`
+/// already gives pending requests -- and the error is still returned for
+/// callers that surface it.
+macro_rules! reject_file_contents_request {
+    ($self:ident, $stream_id:expr, $description:expr) => {{
+        let description = $description;
+        warn!(
+            stream_id = $stream_id,
+            reason = description,
+            "Rejecting file contents request"
+        );
+        $self
+            .backend
+            .on_file_contents_response(FileContentsResponse::new_error($stream_id));
+        return Err(ironrdp_pdu::PduError::new(
+            "request_file_contents",
+            ironrdp_pdu::PduErrorKind::Other { description },
+        ));
+    }};
+}
 
 /// CLIPRDR static virtual channel endpoint implementation
 #[derive(Debug)]
@@ -759,10 +781,10 @@ impl<R: Role> Cliprdr<R> {
         // [MS-RDPECLIP] 2.2.4.1 / Figure 3 - Automatically lock remote clipboard
         // when file data is detected. Sent after FormatListResponse to complete
         // the copy sequence first.
-        if file_list_format.is_some()
-            && let Some(lock_messages) = self.send_lock()
-        {
-            messages.extend(lock_messages);
+        if file_list_format.is_some() {
+            if let Some(lock_messages) = self.send_lock() {
+                messages.extend(lock_messages);
+            }
         }
 
         Ok(messages)
@@ -1172,10 +1194,10 @@ impl<R: Role> Cliprdr<R> {
         }
 
         // Clear current_lock_id if it was expired
-        if let Some(current_id) = self.current_lock_id
-            && expired_ids.contains(&current_id)
-        {
-            self.current_lock_id = None;
+        if let Some(current_id) = self.current_lock_id {
+            if expired_ids.contains(&current_id) {
+                self.current_lock_id = None;
+            }
         }
 
         // Notify backend of timeout-expired locks
@@ -1258,7 +1280,11 @@ impl<R: Role> Cliprdr<R> {
     ///
     /// [2.2.5.3]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpeclip/cbc851d3-4e68-45f4-9292-26872a9209f2
     pub fn request_file_contents(&mut self, mut request: FileContentsRequest) -> PduResult<CliprdrSvcMessages<R>> {
-        self.require_ready("request_file_contents")?;
+        if let Err(error) = self.require_ready("request_file_contents") {
+            self.backend
+                .on_file_contents_response(FileContentsResponse::new_error(request.stream_id));
+            return Err(error);
+        }
 
         // [MS-RDPECLIP] 2.2.2.1.1.1 - CB_STREAM_FILECLIP_ENABLED must be negotiated
         if !self
@@ -1266,12 +1292,7 @@ impl<R: Role> Cliprdr<R> {
             .flags()
             .contains(ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED)
         {
-            return Err(ironrdp_pdu::PduError::new(
-                "request_file_contents",
-                ironrdp_pdu::PduErrorKind::Other {
-                    description: "CB_STREAM_FILECLIP_ENABLED not negotiated",
-                },
-            ));
+            reject_file_contents_request!(self, request.stream_id, "CB_STREAM_FILECLIP_ENABLED not negotiated");
         }
 
         // [MS-RDPECLIP] 2.2.5.3 - Include clipDataId if we have an active lock
@@ -1299,88 +1320,59 @@ impl<R: Role> Cliprdr<R> {
         }
 
         // Update last_used_at to track activity and prevent timeout
-        if let Some(clip_data_id) = request.data_id
-            && let Some(lock) = self.outgoing_locks.get_mut(&clip_data_id)
-        {
-            lock.last_used_at_ms = self.backend.now_ms();
-            trace!(
-                clip_data_id,
-                stream_id = request.stream_id,
-                "Updated lock activity timestamp"
-            );
+        if let Some(clip_data_id) = request.data_id {
+            if let Some(lock) = self.outgoing_locks.get_mut(&clip_data_id) {
+                lock.last_used_at_ms = self.backend.now_ms();
+                trace!(
+                    clip_data_id,
+                    stream_id = request.stream_id,
+                    "Updated lock activity timestamp"
+                );
+            }
         }
 
         // [MS-RDPECLIP] 2.2.5.3 - Validate flags are spec-compliant
         if let Err(e) = request.flags.validate() {
-            return Err(ironrdp_pdu::PduError::new(
-                "request_file_contents",
-                ironrdp_pdu::PduErrorKind::Other { description: e },
-            ));
+            reject_file_contents_request!(self, request.stream_id, e);
         }
 
         // [MS-RDPECLIP] 2.2.5.3 - Validate SIZE request constraints
         if request.flags.contains(FileContentsFlags::SIZE) {
             if request.requested_size != 8 {
-                return Err(ironrdp_pdu::PduError::new(
-                    "request_file_contents",
-                    ironrdp_pdu::PduErrorKind::Other {
-                        description: "SIZE request must have requested_size=8",
-                    },
-                ));
+                reject_file_contents_request!(self, request.stream_id, "SIZE request must have requested_size=8");
             }
             if request.position != 0 {
-                return Err(ironrdp_pdu::PduError::new(
-                    "request_file_contents",
-                    ironrdp_pdu::PduErrorKind::Other {
-                        description: "SIZE request must have position=0",
-                    },
-                ));
+                reject_file_contents_request!(self, request.stream_id, "SIZE request must have position=0");
             }
         }
 
         // [MS-RDPECLIP] 3.1.5.4.5 - Validate file index is from known file list
-        let validated_file_index = usize::try_from(request.index).map_err(|_| {
-            ironrdp_pdu::PduError::new(
-                "request_file_contents",
-                ironrdp_pdu::PduErrorKind::Other {
-                    description: "file index is negative",
-                },
-            )
-        })?;
+        let Ok(validated_file_index) = usize::try_from(request.index) else {
+            reject_file_contents_request!(self, request.stream_id, "file index is negative");
+        };
 
         if let Some(ref file_list) = self.remote_file_list {
             if file_list.files.len() <= validated_file_index {
-                return Err(ironrdp_pdu::PduError::new(
-                    "request_file_contents",
-                    ironrdp_pdu::PduErrorKind::Other {
-                        description: "file index out of bounds for remote file list",
-                    },
-                ));
+                reject_file_contents_request!(self, request.stream_id, "file index out of bounds for remote file list");
             }
 
             // [MS-RDPECLIP] 3.1.5.4.5 - Validate RANGE request is within file bounds
             if request.flags.contains(FileContentsFlags::RANGE) {
                 // Validate requested_size > 0 for RANGE requests
                 if request.requested_size == 0 {
-                    return Err(ironrdp_pdu::PduError::new(
-                        "request_file_contents",
-                        ironrdp_pdu::PduErrorKind::Other {
-                            description: "RANGE request must have requested_size > 0",
-                        },
-                    ));
+                    reject_file_contents_request!(
+                        self,
+                        request.stream_id,
+                        "RANGE request must have requested_size > 0"
+                    );
                 }
 
-                if let Some(file_desc) = file_list.files.get(validated_file_index)
-                    && let Some(file_size) = file_desc.file_size
-                {
-                    let end_position = request.position.saturating_add(u64::from(request.requested_size));
-                    if file_size < end_position {
-                        return Err(ironrdp_pdu::PduError::new(
-                            "request_file_contents",
-                            ironrdp_pdu::PduErrorKind::Other {
-                                description: "RANGE request exceeds file bounds",
-                            },
-                        ));
+                if let Some(file_desc) = file_list.files.get(validated_file_index) {
+                    if let Some(file_size) = file_desc.file_size {
+                        let end_position = request.position.saturating_add(u64::from(request.requested_size));
+                        if file_size < end_position {
+                            reject_file_contents_request!(self, request.stream_id, "RANGE request exceeds file bounds");
+                        }
                     }
                 }
             }
@@ -1393,12 +1385,11 @@ impl<R: Role> Cliprdr<R> {
 
             if !supports_huge_files && 0x8000_0000 <= request.position {
                 // 2^31
-                return Err(ironrdp_pdu::PduError::new(
-                    "request_file_contents",
-                    ironrdp_pdu::PduErrorKind::Other {
-                        description: "large file position requires CB_HUGE_FILE_SUPPORT_ENABLED capability",
-                    },
-                ));
+                reject_file_contents_request!(
+                    self,
+                    request.stream_id,
+                    "large file position requires CB_HUGE_FILE_SUPPORT_ENABLED capability"
+                );
             }
         } else {
             warn!("FileContentsRequest sent without remote file list");
@@ -1407,12 +1398,7 @@ impl<R: Role> Cliprdr<R> {
 
         // Reject if too many requests are already pending.
         if MAX_PENDING_FILE_REQUESTS <= self.sent_file_contents_requests.len() {
-            return Err(ironrdp_pdu::PduError::new(
-                "request_file_contents",
-                ironrdp_pdu::PduErrorKind::Other {
-                    description: "too many pending file contents requests",
-                },
-            ));
+            reject_file_contents_request!(self, request.stream_id, "too many pending file contents requests");
         }
 
         // Track this request so we can validate the response.

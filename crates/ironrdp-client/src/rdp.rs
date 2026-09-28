@@ -1,5 +1,5 @@
 use core::net::SocketAddr;
-use core::num::NonZeroU16;
+use core::num::{NonZeroU16, NonZeroUsize};
 #[cfg(feature = "rdpdr")]
 use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "location")]
@@ -27,6 +27,7 @@ use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
 use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_graphics::pointer::DecodedPointer;
 use ironrdp_pdu::gcc::{ChannelName, Monitor};
+use ironrdp_pdu::geometry::InclusiveRectangle;
 use ironrdp_pdu::input::MousePdu;
 use ironrdp_pdu::input::fast_path::FastPathInputEvent;
 use ironrdp_pdu::input::mouse::PointerFlags;
@@ -130,6 +131,12 @@ pub enum RdpOutputEvent {
     /// stand for many graphics updates: take the area with
     /// [`Framebuffer::take_dirty`](crate::framebuffer::Framebuffer::take_dirty).
     FramebufferUpdated,
+    /// A tightly packed changed region, delivered instead of a full [`RdpOutputEvent::Image`]
+    /// snapshot when the embedder opted into [`DesktopUpdate`] delivery.
+    ///
+    /// Routed through this same output channel (rather than a side-channel callback) so it is
+    /// strictly ordered with respect to [`RdpOutputEvent::Connected`] and every other event.
+    DesktopUpdate(DesktopUpdate),
     ConnectionFailure(ironrdp_connector::ConnectorError),
     PointerDefault,
     PointerHidden,
@@ -211,6 +218,62 @@ pub enum RdpOutputEvent {
     },
 }
 
+/// A tightly packed changed region from the composited desktop framebuffer.
+///
+/// Pixels use the same `0x00RRGGBB` representation as [`RdpOutputEvent::Image`].
+/// `region` uses inclusive coordinates in the full framebuffer described by `width` and `height`.
+#[derive(Debug)]
+pub struct DesktopUpdate {
+    buffer: Vec<u32>,
+    width: NonZeroU16,
+    height: NonZeroU16,
+    region: InclusiveRectangle,
+}
+
+impl DesktopUpdate {
+    /// Builds a validated desktop update.
+    #[must_use]
+    pub fn new(buffer: Vec<u32>, width: NonZeroU16, height: NonZeroU16, region: InclusiveRectangle) -> Option<Self> {
+        let region_width = region.right.checked_sub(region.left)?.checked_add(1)?;
+        let region_height = region.bottom.checked_sub(region.top)?.checked_add(1)?;
+        if region.right >= width.get() || region.bottom >= height.get() {
+            return None;
+        }
+        let pixel_count = usize::from(region_width).checked_mul(usize::from(region_height))?;
+        (buffer.len() == pixel_count).then_some(Self {
+            buffer,
+            width,
+            height,
+            region,
+        })
+    }
+
+    /// Returns the packed `0x00RRGGBB` pixels.
+    pub fn buffer(&self) -> &[u32] {
+        &self.buffer
+    }
+
+    /// Returns the full framebuffer width.
+    pub fn width(&self) -> NonZeroU16 {
+        self.width
+    }
+
+    /// Returns the full framebuffer height.
+    pub fn height(&self) -> NonZeroU16 {
+        self.height
+    }
+
+    /// Returns the changed inclusive framebuffer region.
+    pub fn region(&self) -> InclusiveRectangle {
+        self.region.clone()
+    }
+
+    /// Decomposes the update into its packed pixels, framebuffer extent, and region.
+    pub fn into_parts(self) -> (Vec<u32>, NonZeroU16, NonZeroU16, InclusiveRectangle) {
+        (self.buffer, self.width, self.height, self.region)
+    }
+}
+
 impl RdpOutputEvent {
     /// Classifies how this event should be queued when the output channel is
     /// full: [`crate::output_channel::DropPolicy::MustDeliver`] for events where
@@ -224,6 +287,10 @@ impl RdpOutputEvent {
         use crate::output_channel::DropPolicy;
 
         match self {
+            // `DesktopUpdate` carries a diff against the prior frame, not a full snapshot like
+            // `Image`: dropping a superseded value (as `LatestOnly` does) would silently lose
+            // that region's pixels forever instead of merely re-sending a stale-but-complete
+            // framebuffer, so it falls through to `MustDeliver` below.
             RdpOutputEvent::Image { .. }
             | RdpOutputEvent::FramebufferUpdated
             | RdpOutputEvent::PointerDefault
@@ -590,6 +657,9 @@ const DISPLAY_CONTROL_READY_TIMEOUT: Duration = Duration::from_secs(10);
 struct ResizeQueue {
     in_flight: Option<TimedResizeRequest>,
     pending: Option<TimedResizeRequest>,
+    /// Scale factor and physical size of the layout last requested from the server, starting
+    /// with the ones the connection was made with.
+    layout: (u32, Option<(u32, u32)>),
 }
 
 impl ResizeQueue {
@@ -610,6 +680,7 @@ impl ResizeQueue {
     }
 
     fn mark_in_flight(&mut self, request: ResizeRequest) {
+        self.layout = (request.scale_factor, request.physical_size);
         self.in_flight = Some(TimedResizeRequest {
             request,
             deadline: tokio::time::Instant::now() + DISPLAY_CONTROL_READY_TIMEOUT,
@@ -618,6 +689,14 @@ impl ResizeQueue {
 
     fn completed(&mut self) {
         self.in_flight = None;
+    }
+
+    /// Whether `request` asks for the layout the server already has, with nothing in flight
+    /// that could change it. The server treats such a layout as a no-op and never completes it.
+    fn asks_for_current_layout(&self, request: &ResizeRequest, desktop_size: (u16, u16)) -> bool {
+        self.in_flight.is_none()
+            && (request.width, request.height) == desktop_size
+            && (request.scale_factor, request.physical_size) == self.layout
     }
 
     fn timed_out_request(&self, now: tokio::time::Instant) -> Option<(ResizeRequest, DisplayResizeFallbackReason)> {
@@ -650,6 +729,7 @@ pub struct RdpClient {
     close_receiver: watch::Receiver<bool>,
     graceful_close_receiver: watch::Receiver<bool>,
     auto_reconnect_maximum_attempts: Option<u32>,
+    desktop_update_enabled: bool,
     #[cfg(feature = "clipboard")]
     cliprdr_backend_factory: Option<Box<dyn CliprdrBackendFactory + Send>>,
     #[cfg(feature = "rdpdr")]
@@ -675,6 +755,7 @@ impl RdpClient {
             close_receiver,
             graceful_close_receiver,
             auto_reconnect_maximum_attempts: None,
+            desktop_update_enabled: false,
             #[cfg(feature = "clipboard")]
             cliprdr_backend_factory: None,
             #[cfg(feature = "rdpdr")]
@@ -727,6 +808,19 @@ impl RdpClient {
         self
     }
 
+    /// Delivers tightly packed dirty regions ([`RdpOutputEvent::DesktopUpdate`]) instead of full
+    /// [`RdpOutputEvent::Image`] snapshots.
+    ///
+    /// The first update for each framebuffer extent covers the full framebuffer.
+    /// Every event, including [`RdpOutputEvent::DesktopUpdate`], is delivered through the same
+    /// output channel used for [`RdpOutputEvent::Connected`] and all other events, so relative
+    /// ordering between them is preserved.
+    #[must_use]
+    pub fn with_desktop_updates(mut self) -> Self {
+        self.desktop_update_enabled = true;
+        self
+    }
+
     pub async fn run(mut self) {
         if *self.close_receiver.borrow_and_update() {
             self.emit_user_initiated_termination();
@@ -737,8 +831,8 @@ impl RdpClient {
         //
         // On Windows the WinClipboard object must outlive the entire connection loop, so we
         // keep it alive via `_win_clipboard`; the same goes for LinuxClipboard and
-        // `_linux_clipboard`. Elsewhere a StubClipboard backend is used and its ownership can
-        // be released immediately after the factory is extracted.
+        // `_linux_clipboard`. Elsewhere a StubClipboard backend is used and its ownership can be
+        // released immediately after the factory is extracted.
         #[cfg(all(windows, feature = "clipboard"))]
         #[expect(
             clippy::collection_is_never_read,
@@ -827,8 +921,8 @@ impl RdpClient {
                                 _linux_clipboard = Some(clipboard);
                             }
                             Err(error) => {
-                                // A desktop clipboard is optional: without a display there is
-                                // nothing to bridge, and the session is still useful.
+                                // Without a desktop clipboard there is nothing to bridge, and the
+                                // session is still useful, so this is not a connection failure.
                                 warn!(%error, "OS clipboard unavailable; clipboard redirection is off for this session");
                                 cliprdr_factory = Some(StubClipboard::new().backend_factory());
                                 _linux_clipboard = None;
@@ -1086,9 +1180,11 @@ impl RdpClient {
                 framed,
                 connection_result,
                 udp_tunnel,
+                self.config.connector.desktop_scale_factor,
                 self.config.rail_initial_execute.clone(),
                 &self.output_event_sender,
                 self.framebuffer.as_ref(),
+                self.desktop_update_enabled,
                 &mut self.input_event_receiver,
                 &mut self.clipboard_event_receiver,
                 &mut self.close_receiver,
@@ -2006,6 +2102,7 @@ struct UdpTunnel {
 struct UdpBootstrapConfig {
     peer: SocketAddr,
     server_name: String,
+    offer_version: ironrdp_rdpeudp::pdu::UdpVersion,
     tls: ironrdp_rdpeudp_tokio::UdpTlsConfig,
 }
 
@@ -2026,7 +2123,10 @@ async fn bootstrap_udp_transport(
         .connect(
             config.peer,
             config.server_name,
-            ironrdp_rdpeudp::ConnectionConfig::default(),
+            ironrdp_rdpeudp::ConnectionConfig {
+                offer_version: config.offer_version,
+                ..ironrdp_rdpeudp::ConnectionConfig::default()
+            },
             config.tls,
         )
         .await
@@ -2442,6 +2542,7 @@ where
         let udp_config = UdpBootstrapConfig {
             peer: udp_peer,
             server_name: config.destination.name().to_owned(),
+            offer_version: config.udp_offer_version,
             tls: ironrdp_rdpeudp_tokio::UdpTlsConfig {
                 certificate_validation: config.certificate_validation,
                 certificate_validation_callback: config.certificate_validation_callback.clone(),
@@ -3017,10 +3118,9 @@ impl PerfCounters {
 struct ActiveSessionIteration {
     outputs: Vec<ActiveStageOutput>,
     dvc_batch: Option<DvcMessageBatch>,
-    /// Tunnel the DVC batch is a reply on. MS-RDPEDYC requires responses to go back on
-    /// the transport the request arrived on, which matters for a Create Request received
-    /// on the tunnel and declined (the channel is never bound, so the Soft-Sync routing
-    /// table cannot answer where its NO_LISTENER response belongs).
+    /// The tunnel the DVC batch answers a request from. MS-RDPEDYC responses go back on the
+    /// transport their request arrived on, which the Soft-Sync routing table cannot tell for a
+    /// Create Request received on the tunnel and declined: that channel is never bound.
     reply_tunnel: Option<SoftSyncTunnelType>,
 }
 
@@ -3049,11 +3149,14 @@ impl ActiveSessionIteration {
         }
     }
 
-    fn from_tunnel(tunnel: SoftSyncTunnelType, dvc_batch: DvcMessageBatch, outputs: Vec<ActiveStageOutput>) -> Self {
+    fn tunnel(
+        tunnel_type: SoftSyncTunnelType,
+        (dvc_batch, outputs): (DvcMessageBatch, Vec<ActiveStageOutput>),
+    ) -> Self {
         Self {
             outputs,
             dvc_batch: Some(dvc_batch),
-            reply_tunnel: Some(tunnel),
+            reply_tunnel: Some(tunnel_type),
         }
     }
 }
@@ -3108,6 +3211,69 @@ fn process_rdpdr_drive_change(
     }
 }
 
+fn pack_desktop_update(
+    image: &DecodedImage,
+    width: NonZeroU16,
+    height: NonZeroU16,
+    region: InclusiveRectangle,
+) -> SessionResult<DesktopUpdate> {
+    let region_width = region
+        .right
+        .checked_sub(region.left)
+        .and_then(|width| width.checked_add(1))
+        .ok_or_else(|| ironrdp_session::general_err!("invalid desktop update horizontal bounds"))?;
+    let region_height = region
+        .bottom
+        .checked_sub(region.top)
+        .and_then(|height| height.checked_add(1))
+        .ok_or_else(|| ironrdp_session::general_err!("invalid desktop update vertical bounds"))?;
+    if region.right >= width.get() || region.bottom >= height.get() {
+        return Err(ironrdp_session::general_err!(
+            "desktop update exceeds framebuffer bounds"
+        ));
+    }
+
+    let pixel_count = usize::from(region_width)
+        .checked_mul(usize::from(region_height))
+        .ok_or_else(|| ironrdp_session::general_err!("desktop update pixel count overflow"))?;
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(pixel_count)
+        .map_err(|_| ironrdp_session::general_err!("allocate desktop update buffer"))?;
+
+    let source_width = NonZeroUsize::from(width).get();
+    let left = usize::from(region.left);
+    let row_pixel_count = usize::from(region_width);
+    for y in region.top..=region.bottom {
+        let pixel_offset = usize::from(y)
+            .checked_mul(source_width)
+            .and_then(|offset| offset.checked_add(left))
+            .ok_or_else(|| ironrdp_session::general_err!("desktop update source offset overflow"))?;
+        let byte_offset = pixel_offset
+            .checked_mul(4)
+            .ok_or_else(|| ironrdp_session::general_err!("desktop update byte offset overflow"))?;
+        let byte_len = row_pixel_count
+            .checked_mul(4)
+            .ok_or_else(|| ironrdp_session::general_err!("desktop update row length overflow"))?;
+        let byte_end = byte_offset
+            .checked_add(byte_len)
+            .ok_or_else(|| ironrdp_session::general_err!("desktop update row end overflow"))?;
+        let row = image
+            .data()
+            .get(byte_offset..byte_end)
+            .ok_or_else(|| ironrdp_session::general_err!("desktop update source row is out of bounds"))?;
+        buffer.extend(row.chunks_exact(4).map(|pixel| {
+            let r = pixel[0];
+            let g = pixel[1];
+            let b = pixel[2];
+            u32::from_be_bytes([0, r, g, b])
+        }));
+    }
+
+    DesktopUpdate::new(buffer, width, height, region)
+        .ok_or_else(|| ironrdp_session::general_err!("packed desktop update is inconsistent"))
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "the active loop owns independent transport, input, clipboard, and cancellation sources"
@@ -3117,9 +3283,11 @@ async fn active_session(
     connection_result: ConnectionResult,
     #[cfg(feature = "udp")] mut udp_tunnel: UdpTunnel,
     #[cfg(not(feature = "udp"))] _udp_tunnel: UdpTunnel,
+    desktop_scale_factor: u32,
     initial_rail_execute: Option<ExecutePdu>,
     output_event_sender: &crate::output_channel::OutputEventSender,
     framebuffer: Option<&SharedFramebuffer>,
+    desktop_update_enabled: bool,
     input_event_receiver: &mut mpsc::Receiver<RdpInputEvent>,
     clipboard_event_receiver: &mut mpsc::UnboundedReceiver<RdpInputEvent>,
     close_receiver: &mut watch::Receiver<bool>,
@@ -3139,6 +3307,7 @@ async fn active_session(
     if let Some(framebuffer) = framebuffer {
         framebuffer.lock().invalidate();
     }
+    let mut desktop_update_extent = None;
 
     // We retain the factory to drive the Deactivation-Reactivation Sequence locally.
     let activation_factory = connection_result.activation_factory;
@@ -3184,13 +3353,15 @@ async fn active_session(
     let mut input_batcher = FastPathInputBatcher::new(input_send_interval, now);
     let mut fake_events_interval =
         fake_events_interval.map(|interval| tokio::time::interval(core::cmp::max(interval, Duration::from_secs(1))));
-    let mut resize_queue = ResizeQueue::default();
+    let mut resize_queue = ResizeQueue {
+        layout: (desktop_scale_factor, None),
+        ..ResizeQueue::default()
+    };
     let mut rail_queue_release_deadline = None;
     let mut graceful_shutdown_sent = false;
     let mut post_logon_redraw_requested = false;
     let mut pending_udp_payload: Option<Vec<u8>> = None;
     let mut perf = PerfCounters::new();
-    let mut framebuffer_size = (image.width(), image.height());
     let mut initial_outputs = if *graceful_close_receiver.borrow_and_update() {
         graceful_shutdown_sent = true;
         Some(active_stage.graceful_shutdown()?)
@@ -3207,6 +3378,7 @@ async fn active_session(
     let _ = clipboard_event_receiver;
 
     let disconnect_reason = 'outer: loop {
+        let framebuffer_size = (image.width(), image.height());
         let resize_deadline = resize_queue.deadline();
         let input_batch_deadline = input_batcher.deadline();
         let mut malformed_bitmap_redraw_queued = false;
@@ -3230,13 +3402,12 @@ async fn active_session(
             match pending_udp_payload.take() {
                 Some(payload) => {
                     let processing_started = Instant::now();
-                    let (batch, outputs) =
-                        active_stage.process_dvc_tunnel(SoftSyncTunnelType::RELIABLE_UDP, &payload, &mut image)?;
+                    let processed =
+                        active_stage.process_dvc_tunnel(&mut image, SoftSyncTunnelType::RELIABLE_UDP, &payload)?;
                     perf.account_udp(payload.len(), processing_started.elapsed());
-                    Some(ActiveSessionIteration::from_tunnel(
+                    Some(ActiveSessionIteration::tunnel(
                         SoftSyncTunnelType::RELIABLE_UDP,
-                        batch,
-                        outputs,
+                        processed,
                     ))
                 }
                 None => None,
@@ -3376,13 +3547,13 @@ async fn active_session(
                     Some(payload) => {
                         if active_stage.reliable_udp_dvc_tunnel_in_use() {
                             let processing_started = Instant::now();
-                            let (batch, outputs) = active_stage.process_dvc_tunnel(
+                            let processed = active_stage.process_dvc_tunnel(
+                                &mut image,
                                 SoftSyncTunnelType::RELIABLE_UDP,
                                 &payload,
-                                &mut image,
                             )?;
                             perf.account_udp(payload.len(), processing_started.elapsed());
-                            ActiveSessionIteration::from_tunnel(SoftSyncTunnelType::RELIABLE_UDP, batch, outputs)
+                            ActiveSessionIteration::tunnel(SoftSyncTunnelType::RELIABLE_UDP, processed)
                         } else {
                             // The server can send on UDP immediately after its Soft-Sync request,
                             // before the independently ordered request arrives over TCP. Stop
@@ -3438,7 +3609,12 @@ async fn active_session(
                             scale_factor,
                             physical_size,
                         };
-                        if resize_queue.in_flight.is_some() || active_stage.display_control_ready() == Some(false) {
+                        if resize_queue.asks_for_current_layout(&request, (image.width(), image.height())) {
+                            // This request also supersedes a deferred one.
+                            debug!(width, height, "Display already has the requested layout");
+                            resize_queue.pending = None;
+                            ActiveSessionIteration::outputs(Vec::new())
+                        } else if resize_queue.in_flight.is_some() || active_stage.display_control_ready() == Some(false) {
                             resize_queue.defer(request);
                             ActiveSessionIteration::outputs(Vec::new())
                         } else if let Some(dvc_batch) = active_stage.prepare_resize(
@@ -3813,21 +3989,24 @@ async fn active_session(
         };
 
         perf.report_if_due(&active_stage, framebuffer);
-        if framebuffer_size != (image.width(), image.height()) {
-            // The graphics pipeline resized the framebuffer (see
-            // `ActiveStage::drain_graphics_pipeline`); that is how a resize completes
-            // on EGFX, so stop waiting for a reactivation that will not come.
-            framebuffer_size = (image.width(), image.height());
-            if resize_queue.in_flight.take().is_some() {
-                info!(
-                    width = framebuffer_size.0,
-                    height = framebuffer_size.1,
-                    "Resize completed by the graphics pipeline"
-                );
-            }
+        // With the graphics pipeline, the server completes a Display Control resize with a
+        // ResetGraphics declaring the new output size instead of a Deactivation-Reactivation
+        // Sequence, and the session follows it by resizing the framebuffer. Waiting on for a
+        // reactivation would end in a needless reconnect once the deadline passes.
+        if resize_queue.in_flight.is_some() && (image.width(), image.height()) != framebuffer_size {
+            info!(
+                width = image.width(),
+                height = image.height(),
+                "Resize completed by the graphics pipeline"
+            );
+            resize_queue.completed();
         }
         #[cfg(feature = "udp")]
-        let udp_version = udp_tunnel.transport.as_ref().and_then(|t| t.negotiated_version());
+        let udp_version = udp_tunnel
+            .transport
+            .as_ref()
+            .and_then(ironrdp_rdpeudp_tokio::UdpTransport::negotiated_version)
+            .map(|version| version.0);
         #[cfg(not(feature = "udp"))]
         let udp_version = None;
         if let Some(event) = perf.transport_event_if_changed(&active_stage, udp_version)
@@ -3846,7 +4025,7 @@ async fn active_session(
                 || active_stage.dvc_tunnel_for_channel(channel_id) == Some(SoftSyncTunnelType::RELIABLE_UDP);
             #[cfg(not(feature = "udp"))]
             let route_over_udp = {
-                let _ = channel_id;
+                let _ = (channel_id, iteration.reply_tunnel);
                 false
             };
             if route_over_udp {
@@ -3882,6 +4061,8 @@ async fn active_session(
             }
         }
 
+        let mut desktop_damage_regions = active_stage.take_damage_regions();
+        let mut desktop_damage_delivered = false;
         for out in iteration.outputs {
             match out {
                 ActiveStageOutput::AutoReconnectCookie(cookie) => {
@@ -3905,37 +4086,105 @@ async fn active_session(
                     }
                 }
                 ActiveStageOutput::GraphicsUpdate(region) => {
-                    let converting = Instant::now();
-                    let event = match framebuffer {
+                    let width =
+                        NonZeroU16::new(image.width()).ok_or_else(|| ironrdp_session::general_err!("width is zero"))?;
+                    let height = NonZeroU16::new(image.height())
+                        .ok_or_else(|| ironrdp_session::general_err!("height is zero"))?;
+                    if let Some(framebuffer) = framebuffer {
                         // Only the host's first look at a pending area needs an event; later
                         // updates merge into that area.
-                        Some(framebuffer) => framebuffer
+                        let converting = Instant::now();
+                        let changed = framebuffer
                             .lock()
-                            .update(image.data(), image.width(), image.height(), &region)
-                            .then_some(RdpOutputEvent::FramebufferUpdated),
-                        None => {
-                            let buffer: Vec<u32> = image
-                                .data()
-                                .chunks_exact(4)
-                                .map(|pixel| {
-                                    let r = pixel[0];
-                                    let g = pixel[1];
-                                    let b = pixel[2];
-                                    u32::from_be_bytes([0, r, g, b])
-                                })
-                                .collect();
-                            Some(RdpOutputEvent::Image {
-                                buffer,
-                                width: NonZeroU16::new(image.width())
-                                    .ok_or_else(|| ironrdp_session::general_err!("width is zero"))?,
-                                height: NonZeroU16::new(image.height())
-                                    .ok_or_else(|| ironrdp_session::general_err!("height is zero"))?,
-                            })
+                            .update(image.data(), image.width(), image.height(), &region);
+                        perf.account_conversion(converting.elapsed());
+                        if changed
+                            && !send_active_output_event(
+                                output_event_sender,
+                                RdpOutputEvent::FramebufferUpdated,
+                                close_receiver,
+                            )
+                            .await?
+                        {
+                            return Ok(RdpControlFlow::TerminatedGracefully(
+                                GracefulDisconnectReason::UserInitiated,
+                            ));
                         }
-                    };
+                        continue;
+                    }
+                    if desktop_update_enabled {
+                        if desktop_damage_delivered {
+                            continue;
+                        }
+                        desktop_damage_delivered = true;
+                        let extent = (width, height);
+                        if desktop_update_extent != Some(extent) {
+                            desktop_update_extent = Some(extent);
+                            let update = pack_desktop_update(
+                                &image,
+                                width,
+                                height,
+                                InclusiveRectangle {
+                                    left: 0,
+                                    top: 0,
+                                    right: width.get() - 1,
+                                    bottom: height.get() - 1,
+                                },
+                            )?;
+                            if !send_active_output_event(
+                                output_event_sender,
+                                RdpOutputEvent::DesktopUpdate(update),
+                                close_receiver,
+                            )
+                            .await?
+                            {
+                                return Ok(RdpControlFlow::TerminatedGracefully(
+                                    GracefulDisconnectReason::UserInitiated,
+                                ));
+                            }
+                            desktop_damage_regions.clear();
+                        } else {
+                            if desktop_damage_regions.is_empty() {
+                                desktop_damage_regions.push(region);
+                            }
+                            for region in desktop_damage_regions.drain(..) {
+                                let update = pack_desktop_update(&image, width, height, region)?;
+                                if !send_active_output_event(
+                                    output_event_sender,
+                                    RdpOutputEvent::DesktopUpdate(update),
+                                    close_receiver,
+                                )
+                                .await?
+                                {
+                                    return Ok(RdpControlFlow::TerminatedGracefully(
+                                        GracefulDisconnectReason::UserInitiated,
+                                    ));
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    let converting = Instant::now();
+                    let buffer = pack_desktop_update(
+                        &image,
+                        width,
+                        height,
+                        InclusiveRectangle {
+                            left: 0,
+                            top: 0,
+                            right: width.get() - 1,
+                            bottom: height.get() - 1,
+                        },
+                    )?
+                    .buffer;
                     perf.account_conversion(converting.elapsed());
-                    if let Some(event) = event
-                        && !send_active_output_event(output_event_sender, event, close_receiver).await?
+                    if !send_active_output_event(
+                        output_event_sender,
+                        RdpOutputEvent::Image { buffer, width, height },
+                        close_receiver,
+                    )
+                    .await?
                     {
                         return Ok(RdpControlFlow::TerminatedGracefully(
                             GracefulDisconnectReason::UserInitiated,
@@ -4153,6 +4402,7 @@ async fn active_session(
                             if let Some(framebuffer) = framebuffer {
                                 framebuffer.lock().invalidate();
                             }
+                            desktop_update_extent = None;
                             resize_queue.completed();
                             if !active_stage.reactivate(
                                 connection_activation.io_channel_id(),
@@ -4837,6 +5087,31 @@ mod tests {
             queue.timed_out_request(deadline),
             Some((request, DisplayResizeFallbackReason::CapabilitiesTimedOut))
         );
+    }
+
+    #[test]
+    fn resize_queue_recognizes_a_request_for_the_current_layout() {
+        let mut queue = ResizeQueue {
+            layout: (100, None),
+            ..ResizeQueue::default()
+        };
+        let current = resize_request(1024, 768);
+        assert_eq!((current.scale_factor, current.physical_size), (100, None));
+
+        assert!(queue.asks_for_current_layout(&current, (1024, 768)));
+        assert!(!queue.asks_for_current_layout(&current, (1280, 720)));
+        let rescaled = ResizeRequest {
+            scale_factor: 150,
+            ..current
+        };
+        assert!(!queue.asks_for_current_layout(&rescaled, (1024, 768)));
+
+        // A request in flight can still change the layout, so nothing is a no-op meanwhile.
+        queue.mark_in_flight(rescaled);
+        assert!(!queue.asks_for_current_layout(&rescaled, (1024, 768)));
+        queue.completed();
+        assert!(queue.asks_for_current_layout(&rescaled, (1024, 768)));
+        assert!(!queue.asks_for_current_layout(&current, (1024, 768)));
     }
 
     #[test]
