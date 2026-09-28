@@ -316,6 +316,9 @@ impl Driver {
                 Event::Connected => {
                     if !self.connected_signaled {
                         self.connected_signaled = true;
+                        if let Ok(mut shared) = self.shared.lock() {
+                            shared.negotiated_version = self.conn.negotiated_version();
+                        }
                         self.connected_notify.notify_one();
                     }
                 }
