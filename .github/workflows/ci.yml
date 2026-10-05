@@ -8,6 +8,13 @@ on:
     types: [opened, synchronize, reopened]
   workflow_dispatch:
 
+# A new push to a pull request cancels the run it replaces. Pull requests also
+# restore master's Rust cache without saving their own (save-if below), so they
+# cannot push master's cache out of the repository's 10 GB.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   # Disable incremental compilation. CI builds are often closer to from-scratch builds, as changes
   # are typically bigger than from a local edit-compile cycle.
@@ -124,6 +131,8 @@ jobs:
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Binary cache
         uses: actions/cache@v5
@@ -169,6 +178,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2.9.1
         with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
           workspaces: fuzz -> target
 
       - name: Binary cache
@@ -197,6 +207,8 @@ jobs:
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Binary cache
         uses: actions/cache@v5
@@ -223,6 +235,8 @@ jobs:
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Binary cache
         uses: actions/cache@v5
@@ -254,6 +268,8 @@ jobs:
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Setup matrix
         id: setup-matrix
@@ -278,6 +294,8 @@ jobs:
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Binary cache
         uses: actions/cache@v5

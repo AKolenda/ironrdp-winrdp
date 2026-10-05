@@ -80,6 +80,8 @@ jobs:
         with:
           name: npm-${{matrix.library}}
           path: npm-packages/*.tgz
+          # Merged into the npm artifact by the next job.
+          retention-days: 1
 
   npm-merge:
     name: Merge artifacts

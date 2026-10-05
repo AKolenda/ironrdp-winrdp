@@ -279,6 +279,8 @@ jobs:
         with:
           name: ironrdp-${{matrix.os}}-${{matrix.arch}}
           path: dependencies/runtimes/${{matrix.os}}-${{matrix.arch}}
+          # Only later jobs of this run read it.
+          retention-days: 1
 
   build-universal:
     name: Universal build
@@ -318,6 +320,8 @@ jobs:
         with:
           name: ironrdp-${{ matrix.os }}-universal
           path: dependencies/runtimes/${{ matrix.os }}-universal
+          # Only later jobs of this run read it.
+          retention-days: 1
 
   build-managed:
     name: Managed build
