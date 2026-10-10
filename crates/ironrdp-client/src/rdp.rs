@@ -9,7 +9,6 @@ use std::io;
 use std::sync::Arc;
 #[cfg(feature = "location")]
 use std::sync::mpsc as std_mpsc;
-#[cfg(feature = "location")]
 use std::time::Instant;
 
 #[cfg(feature = "clipboard")]
@@ -3010,6 +3009,118 @@ fn frame_read_failure(error: io::Error, graceful_shutdown_sent: bool) -> Session
     }
 }
 
+/// Per-second session performance counters, logged at INFO as `session perf` so
+/// transports (TCP vs reliable UDP) can be compared from the log alone.
+///
+/// `busy_pct` is PDU decoding, `convert_pct` turning decoded graphics into the host's
+/// framebuffer, and `present_pct` the host's own presenting as it reports it through
+/// [`Framebuffer::record_present`](crate::framebuffer::Framebuffer::record_present).
+struct PerfCounters {
+    started: Instant,
+    last_report: Instant,
+    tcp_bytes: u64,
+    udp_bytes: u64,
+    tcp_bytes_total: u64,
+    udp_bytes_total: u64,
+    /// Time spent decoding/processing inbound PDUs since the last report.
+    busy: Duration,
+    busy_total: Duration,
+    /// Time spent converting decoded graphics for the host since the last report.
+    convert: Duration,
+    last_frames: u32,
+    first_frames: Option<u32>,
+}
+
+impl PerfCounters {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            last_report: now,
+            tcp_bytes: 0,
+            udp_bytes: 0,
+            tcp_bytes_total: 0,
+            udp_bytes_total: 0,
+            busy: Duration::ZERO,
+            busy_total: Duration::ZERO,
+            convert: Duration::ZERO,
+            last_frames: 0,
+            first_frames: None,
+        }
+    }
+
+    #[expect(
+        clippy::as_conversions,
+        reason = "u64-to-f64 loses precision only above 2^53 bytes, acceptable for a log line"
+    )]
+    fn report_if_due(&mut self, active_stage: &ActiveStage, framebuffer: Option<&SharedFramebuffer>) {
+        let elapsed = self.last_report.elapsed();
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+        let present = framebuffer.map_or(Duration::ZERO, |framebuffer| framebuffer.lock().take_present_time());
+        let frames_decoded = active_stage
+            .get_dvc::<GraphicsPipelineClient>()
+            .map(|gfx| gfx.processor().total_frames_decoded())
+            .unwrap_or(0);
+        let first = *self.first_frames.get_or_insert(frames_decoded);
+        let frames = frames_decoded.wrapping_sub(self.last_frames);
+        self.last_frames = frames_decoded;
+        let secs = elapsed.as_secs_f64();
+        let bytes = self.tcp_bytes + self.udp_bytes;
+        let transport = if active_stage.reliable_udp_dvc_tunnel_in_use() {
+            "udp"
+        } else {
+            "tcp"
+        };
+        let uptime = self.started.elapsed().as_secs_f64();
+        info!(
+            transport,
+            fps = format_args!("{:.1}", f64::from(frames) / secs),
+            kbps = format_args!("{:.0}", bytes as f64 * 8.0 / 1000.0 / secs),
+            busy_pct = format_args!("{:.1}", self.busy.as_secs_f64() * 100.0 / secs),
+            convert_pct = format_args!("{:.1}", self.convert.as_secs_f64() * 100.0 / secs),
+            present_pct = format_args!("{:.1}", present.as_secs_f64() * 100.0 / secs),
+            tcp_bytes = self.tcp_bytes,
+            udp_bytes = self.udp_bytes,
+            frames_total = frames_decoded.wrapping_sub(first),
+            avg_fps = format_args!(
+                "{:.1}",
+                f64::from(frames_decoded.wrapping_sub(first)) / uptime.max(1e-3)
+            ),
+            mb_total = format_args!("{:.2}", (self.tcp_bytes_total + self.udp_bytes_total) as f64 / 1e6),
+            busy_total_ms = self.busy_total.as_millis(),
+            uptime_s = format_args!("{uptime:.0}"),
+            "session perf"
+        );
+        self.tcp_bytes = 0;
+        self.udp_bytes = 0;
+        self.busy = Duration::ZERO;
+        self.convert = Duration::ZERO;
+        self.last_report = Instant::now();
+    }
+
+    fn account_conversion(&mut self, elapsed: Duration) {
+        self.convert += elapsed;
+    }
+
+    fn account_tcp(&mut self, len: usize, busy: Duration) {
+        let len = u64::try_from(len).unwrap_or(u64::MAX);
+        self.tcp_bytes += len;
+        self.tcp_bytes_total += len;
+        self.busy += busy;
+        self.busy_total += busy;
+    }
+
+    fn account_udp(&mut self, len: usize, busy: Duration) {
+        let len = u64::try_from(len).unwrap_or(u64::MAX);
+        self.udp_bytes += len;
+        self.udp_bytes_total += len;
+        self.busy += busy;
+        self.busy_total += busy;
+    }
+}
+
 struct ActiveSessionIteration {
     outputs: Vec<ActiveStageOutput>,
     dvc_batch: Option<DvcMessageBatch>,
@@ -3253,6 +3364,7 @@ async fn active_session(
     let mut post_logon_redraw_requested = false;
     let mut pending_udp_payload: Option<Vec<u8>> = None;
     let mut announced_transport = None;
+    let mut perf = PerfCounters::new();
     let mut initial_outputs = if *graceful_close_receiver.borrow_and_update() {
         graceful_shutdown_sent = true;
         Some(active_stage.graceful_shutdown()?)
@@ -3291,10 +3403,16 @@ async fn active_session(
         };
         let buffered_udp_iteration = if initial_outputs.is_none() && active_stage.reliable_udp_dvc_tunnel_in_use() {
             match pending_udp_payload.take() {
-                Some(payload) => Some(ActiveSessionIteration::tunnel(
-                    SoftSyncTunnelType::RELIABLE_UDP,
-                    active_stage.process_dvc_tunnel(&mut image, SoftSyncTunnelType::RELIABLE_UDP, &payload)?,
-                )),
+                Some(payload) => {
+                    let processing_started = Instant::now();
+                    let processed =
+                        active_stage.process_dvc_tunnel(&mut image, SoftSyncTunnelType::RELIABLE_UDP, &payload)?;
+                    perf.account_udp(payload.len(), processing_started.elapsed());
+                    Some(ActiveSessionIteration::tunnel(
+                        SoftSyncTunnelType::RELIABLE_UDP,
+                        processed,
+                    ))
+                }
                 None => None,
             }
         } else {
@@ -3330,8 +3448,10 @@ async fn active_session(
                         Err(error) => return frame_read_failure(error, graceful_shutdown_sent),
                     };
                     trace!(?action, frame_length = payload.len(), "Frame received");
+                    let processing_started = Instant::now();
                     let mut outputs =
                         active_stage.process_with_timestamp(&mut image, action, &payload, reader.last_read_at())?;
+                    perf.account_tcp(payload.len(), processing_started.elapsed());
                     #[cfg(feature = "rdpdr")]
                     if let Some(output) = poll_deferred_rdpdr_output(&mut active_stage)? {
                         outputs.push(output);
@@ -3429,14 +3549,14 @@ async fn active_session(
                     }
                     Some(payload) => {
                         if active_stage.reliable_udp_dvc_tunnel_in_use() {
-                            ActiveSessionIteration::tunnel(
+                            let processing_started = Instant::now();
+                            let processed = active_stage.process_dvc_tunnel(
+                                &mut image,
                                 SoftSyncTunnelType::RELIABLE_UDP,
-                                active_stage.process_dvc_tunnel(
-                                    &mut image,
-                                    SoftSyncTunnelType::RELIABLE_UDP,
-                                    &payload,
-                                )?,
-                            )
+                                &payload,
+                            )?;
+                            perf.account_udp(payload.len(), processing_started.elapsed());
+                            ActiveSessionIteration::tunnel(SoftSyncTunnelType::RELIABLE_UDP, processed)
                         } else {
                             // The server can send on UDP immediately after its Soft-Sync request,
                             // before the independently ordered request arrives over TCP. Stop
@@ -3865,6 +3985,7 @@ async fn active_session(
             }
         };
 
+        perf.report_if_due(&active_stage, framebuffer);
         // ResetGraphics is an explicit completion signal even when a scale-only
         // change leaves the pixel dimensions unchanged. Out-of-band resets must
         // match the outstanding request before its layout is recorded as applied.
@@ -3954,9 +4075,11 @@ async fn active_session(
                     if let Some(framebuffer) = framebuffer {
                         // Only the host's first look at a pending area needs an event; later
                         // updates merge into that area.
+                        let converting = Instant::now();
                         let changed = framebuffer
                             .lock()
                             .update(image.data(), image.width(), image.height(), &region);
+                        perf.account_conversion(converting.elapsed());
                         if changed
                             && !send_active_output_event(
                                 output_event_sender,
@@ -4024,6 +4147,7 @@ async fn active_session(
                         continue;
                     }
 
+                    let converting = Instant::now();
                     let buffer = pack_desktop_update(
                         &image,
                         width,
@@ -4036,6 +4160,7 @@ async fn active_session(
                         },
                     )?
                     .buffer;
+                    perf.account_conversion(converting.elapsed());
                     if !send_active_output_event(
                         output_event_sender,
                         RdpOutputEvent::Image { buffer, width, height },
