@@ -6,6 +6,7 @@ Native backend building blocks for the IronRDP RDPDR static channel.
   backend.
   The `nix::printer` backend spools PostScript jobs in an exclusively created private directory (0700), using exclusive 0600 files.
   A worker thread submits each closed job to CUPS through `lp`, which gets 60 seconds to accept it, or saves it in the configured folder without replacing existing files.
+  When `lp` is missing or cannot take a job, the job is saved in the user's downloads folder (or home directory) instead.
   A job is limited to 128 MiB and at most 16 jobs are open at once; dropping the backend deletes unfinished spool files.
 - On Windows, the crate contains the native, handle-relative filesystem foundation used for drive redirection.
   It validates every protocol path before resolving it below an opened volume root, and it rejects DOS device aliases and reparse-point traversal.

@@ -6,7 +6,8 @@
 //! pushes the bytes down as a create / write... / close sequence on that
 //! device. The job is spooled to a temporary file while it streams. On close,
 //! a worker thread hands it to `lp` or saves it in the configured folder, so a
-//! slow print system never stalls the channel.
+//! slow print system never stalls the channel. When `lp` is missing or cannot
+//! take the job, it is saved in the user's downloads folder instead.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -78,6 +79,8 @@ struct Submitter {
 #[derive(Debug)]
 pub struct PrinterSpooler {
     target: PrintTarget,
+    /// Where a job goes when `lp` is missing or cannot take it.
+    fallback_dir: PathBuf,
     /// Private, atomically created 0700 directory, allocated on the first print job.
     spool_dir: Option<PathBuf>,
     next_file_id: u32,
@@ -92,6 +95,7 @@ impl PrinterSpooler {
     pub fn new(target: PrintTarget) -> Self {
         Self {
             target,
+            fallback_dir: default_fallback_dir(),
             spool_dir: None,
             next_file_id: 1,
             jobs: HashMap::new(),
@@ -214,7 +218,7 @@ impl PrinterSpooler {
             let Some(spool_dir) = self.spool_dir.clone() else {
                 return;
             };
-            match Submitter::spawn(self.target.clone(), spool_dir) {
+            match Submitter::spawn(self.target.clone(), self.fallback_dir.clone(), spool_dir) {
                 Ok(submitter) => self.submitter = Some(submitter),
                 Err(error) => {
                     warn!(%error, "Could not start the print submission thread; the print job is discarded");
@@ -267,22 +271,28 @@ impl Drop for PrinterSpooler {
 }
 
 impl Submitter {
-    fn spawn(target: PrintTarget, spool_dir: PathBuf) -> std::io::Result<Self> {
+    fn spawn(target: PrintTarget, fallback_dir: PathBuf, spool_dir: PathBuf) -> std::io::Result<Self> {
         let (jobs, queue) = sync_channel(SUBMISSION_QUEUE_CAPACITY);
         let thread = std::thread::Builder::new()
             .name("ironrdp-print-submit".to_owned())
-            .spawn(move || submit_jobs(&target, &spool_dir, queue))?;
+            .spawn(move || submit_jobs(&target, &fallback_dir, &spool_dir, queue))?;
         Ok(Self { jobs, thread })
     }
 }
 
 /// Submits queued jobs until the spooler is gone, then removes the spool directory.
-fn submit_jobs(target: &PrintTarget, spool_dir: &Path, queue: Receiver<FinishedJob>) {
+fn submit_jobs(target: &PrintTarget, fallback_dir: &Path, spool_dir: &Path, queue: Receiver<FinishedJob>) {
     for job in queue {
-        match target {
+        let printed = match target {
             PrintTarget::DefaultPrinter => print(&job, None),
             PrintTarget::Printer(name) => print(&job, Some(name)),
-            PrintTarget::Folder(dir) => save(&job.spool, dir),
+            PrintTarget::Folder(dir) => {
+                save(&job.spool, dir);
+                true
+            }
+        };
+        if !printed {
+            save(&job.spool, fallback_dir);
         }
         let _ = std::fs::remove_file(&job.spool);
     }
@@ -290,7 +300,8 @@ fn submit_jobs(target: &PrintTarget, spool_dir: &Path, queue: Receiver<FinishedJ
 }
 
 /// Hands the job to `lp`, killing it if it has not accepted the job within [`LP_TIMEOUT`].
-fn print(job: &FinishedJob, destination: Option<&str>) {
+/// Returns whether `lp` accepted the job.
+fn print(job: &FinishedJob, destination: Option<&str>) -> bool {
     let mut command = Command::new("lp");
     if let Some(name) = destination {
         command.arg("-d").arg(name);
@@ -305,8 +316,8 @@ fn print(job: &FinishedJob, destination: Option<&str>) {
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            warn!(%error, "lp is not available; the print job is discarded");
-            return;
+            warn!(%error, "lp is not available; keeping the print job as a file instead");
+            return false;
         }
     };
     // The pipes are drained while lp runs, so output beyond the pipe buffer cannot block it.
@@ -320,14 +331,14 @@ fn print(job: &FinishedJob, destination: Option<&str>) {
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                warn!(timeout = ?LP_TIMEOUT, "lp did not accept the print job in time; the job is discarded");
-                return;
+                warn!(timeout = ?LP_TIMEOUT, "lp did not accept the print job in time; keeping it as a file instead");
+                return false;
             }
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                warn!(%error, "Could not wait for lp; the print job is discarded");
-                return;
+                warn!(%error, "Could not wait for lp; keeping the print job as a file instead");
+                return false;
             }
         }
     };
@@ -336,7 +347,35 @@ fn print(job: &FinishedJob, destination: Option<&str>) {
     if status.success() {
         info!(bytes = job.bytes, "Print job handed to lp: {}", stdout.trim());
     } else {
-        warn!("lp refused the print job ({}); the job is discarded", stderr.trim());
+        warn!(
+            "lp refused the print job ({}); keeping it as a file instead",
+            stderr.trim()
+        );
+    }
+    status.success()
+}
+
+/// The user's downloads folder, or the home directory when there is none.
+fn default_fallback_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let downloads = home.join("Downloads");
+    if downloads.is_dir() { downloads } else { home }
+}
+
+impl PrintTarget {
+    /// Parses a target description: `default` (or an empty string), `folder:<dir>`, or a CUPS
+    /// destination name.
+    pub fn parse(value: &str) -> Self {
+        let value = value.trim();
+        if value.is_empty() || value.eq_ignore_ascii_case("default") {
+            Self::DefaultPrinter
+        } else if let Some(dir) = value.strip_prefix("folder:") {
+            Self::Folder(PathBuf::from(dir))
+        } else {
+            Self::Printer(value.to_owned())
+        }
     }
 }
 
@@ -592,6 +631,14 @@ mod tests {
             panic!("expected a write response");
         };
         assert_eq!(response.length, 0);
+    }
+
+    #[test]
+    fn targets_parse_from_a_description() {
+        assert!(matches!(PrintTarget::parse("default"), PrintTarget::DefaultPrinter));
+        assert!(matches!(PrintTarget::parse(""), PrintTarget::DefaultPrinter));
+        assert!(matches!(PrintTarget::parse("HP_LaserJet"), PrintTarget::Printer(n) if n == "HP_LaserJet"));
+        assert!(matches!(PrintTarget::parse("folder:/tmp/out"), PrintTarget::Folder(p) if p == Path::new("/tmp/out")));
     }
 
     #[test]
