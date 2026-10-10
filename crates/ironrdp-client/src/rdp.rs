@@ -1130,7 +1130,7 @@ struct InFlightResize {
     from_size: (u16, u16),
 }
 
-const DISPLAY_CONTROL_READY_TIMEOUT: Duration = Duration::from_secs(3);
+const DISPLAY_CONTROL_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The largest virtual desktop width or height the GCC Client Monitor Data block may describe.
 const MAX_VIRTUAL_DESKTOP_DIMENSION: u32 = 32_766;
