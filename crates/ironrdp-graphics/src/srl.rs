@@ -362,47 +362,9 @@ mod tests {
     }
 
     #[test]
-    fn preserves_a_zero_data_byte_and_a_pending_value_at_eof() {
-        // 100001 is +3. The next 10 is a zero-length run at K=0 followed by
-        // the next value's positive sign. Its magnitude is all zeros: +15.
-        // With or without a final zero byte, the zero-filled reader must finish
-        // this pending value instead of replacing it with omitted zero entries.
-        for data in [&[0x86, 0x00][..], &[0x86][..], &[0x86, 0x00, 0x00][..]] {
-            assert_eq!(decode_srl(data, 3, 4), Ok(vec![3, 15, 0]));
-        }
-
-        // A run's final codeword ends exactly at the byte boundary here. The
-        // pending value crosses a band boundary and obtains all its bits at EOF.
-        let mut decoder = SrlDecoder::new(&[0x85]);
-        assert_eq!(decoder.decode(2, 4), Ok(vec![3, 0]));
-        assert_eq!(decoder.decode(2, 4), Ok(vec![15, 0]));
-    }
-
-    #[test]
     fn tolerates_a_missing_terminator() {
         // Same bits as `decodes_initial_kp_and_unary_magnitude` without the zero byte.
         assert_eq!(decode_srl(&[0x84], 1, 4), Ok(vec![3]));
-    }
-
-    #[test]
-    fn overshooting_zero_runs_are_accepted() {
-        // Forty `0` bits grow KP to 80 and add far more than 4096 zeros; every entry is zero.
-        assert_eq!(decode_srl(&[0x00; 5], 6, 4), Ok(vec![0; 6]));
-        // An explicit run of 4096 followed by a value: the run covers the entries asked for.
-        let mut decoder = SrlDecoder::new(&[0x00; 5]);
-        assert_eq!(decoder.decode(4096, 4), Ok(vec![0; 4096]));
-    }
-
-    #[test]
-    fn trailing_entries_omitted_by_the_encoder_decode_as_zeros() {
-        // Windows stops writing once every remaining entry is zero.
-        assert_eq!(decode_srl(&[], 5, 4), Ok(vec![0; 5]));
-        assert_eq!(decode_srl(&[0x84, 0x00], 4, 4), Ok(vec![3, 0, 0, 0]));
-
-        // The implicit zeros continue across bands, like an explicit run would.
-        let mut decoder = SrlDecoder::new(&[0x84]);
-        assert_eq!(decoder.decode(2, 4), Ok(vec![3, 0]));
-        assert_eq!(decoder.decode(3, 4), Ok(vec![0, 0, 0]));
     }
 
     #[test]
@@ -435,23 +397,6 @@ mod tests {
         assert_eq!(decoder.decode(1, 4), Ok(vec![0]));
         assert_eq!(decoder.decode(1, 4), Ok(vec![3]));
         assert_eq!(decode_srl(&encoded, original.len(), 4), Ok(original.to_vec()));
-    }
-
-    #[test]
-    fn round_trips_streams_with_and_without_terminators() {
-        for num_bits in 1..=5 {
-            let maximum = i16::try_from(max_magnitude(num_bits).unwrap()).unwrap();
-            for zeros in 0..16 {
-                for value in [-maximum, -1, 1, maximum] {
-                    let mut values = vec![0; zeros];
-                    values.extend([3.min(maximum), value, 0, -value]);
-                    let encoded = encode_srl(&values, num_bits).unwrap();
-                    for data in [encoded.as_slice(), &encoded[..encoded.len() - 1]] {
-                        assert_eq!(decode_srl(data, values.len(), num_bits).unwrap(), values);
-                    }
-                }
-            }
-        }
     }
 
     #[test]

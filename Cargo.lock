@@ -3003,7 +3003,6 @@ name = "ironrdp-fuzzing"
 version = "0.0.0"
 dependencies = [
  "arbitrary",
- "ironrdp-autodetect",
  "ironrdp-bulk",
  "ironrdp-cliprdr",
  "ironrdp-cliprdr-format",
@@ -3477,8 +3476,6 @@ dependencies = [
  "ironrdp-bulk",
  "ironrdp-cfg",
  "ironrdp-client",
- "ironrdp-cliprdr",
- "ironrdp-cliprdr-format",
  "ironrdp-cliprdr-native",
  "ironrdp-core 0.2.1",
  "ironrdp-daemon",
@@ -3504,7 +3501,6 @@ dependencies = [
  "ironrdp-tokio",
  "ironrdp-viewer",
  "ironrdp-vmconnect",
- "png",
  "rcgen",
  "semver",
  "tokio",

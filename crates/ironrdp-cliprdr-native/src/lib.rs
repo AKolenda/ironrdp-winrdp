@@ -17,12 +17,10 @@ pub use crate::windows::{HWND, WinClipboard, WinCliprdrError, WinCliprdrResult};
 
 #[cfg(target_os = "linux")]
 pub mod data_control;
-#[cfg(all(target_os = "linux", feature = "__test"))]
-pub mod linux;
-#[cfg(all(target_os = "linux", not(feature = "__test")))]
+#[cfg(target_os = "linux")]
 #[expect(
     unreachable_pub,
-    reason = "the __test feature exposes internals to the shared test suite"
+    reason = "internal items keep `pub` visibility inside this private module"
 )]
 pub(crate) mod linux;
 #[cfg(target_os = "linux")]
