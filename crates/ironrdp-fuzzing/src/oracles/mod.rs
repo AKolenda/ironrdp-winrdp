@@ -10,9 +10,6 @@
 //! When an oracle finds a bug, it should report it to the fuzzing engine by
 //! panicking.
 
-mod autodetect;
-pub use autodetect::autodetect_state;
-
 use crate::generators::BitmapInput;
 
 // Bulk decompression oracles. Each target is algorithm-pinned so libFuzzer

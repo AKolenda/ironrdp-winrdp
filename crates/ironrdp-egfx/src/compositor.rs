@@ -1151,10 +1151,9 @@ mod tests {
         assert_eq!(c.surfaces.len(), 1);
     }
 
-    /// `ResetGraphics` empties the surface map, so its charge goes with it; the cache
-    /// survives the reset and so does its charge.
+    /// `ResetGraphics` empties both maps, so it must zero the charge with them.
     #[test]
-    fn reset_releases_the_surface_charge_and_keeps_the_cache() {
+    fn reset_releases_the_whole_charge() {
         const EDGE: u16 = 4096;
         let mut c = Compositor::default();
         c.reset(1920, 1080);
@@ -1167,49 +1166,6 @@ mod tests {
             c.allocated_bytes, 0,
             "reset drops every surface, so it drops the charge"
         );
-
-        c.create_surface(1, 16, 16);
-        c.map_surface(1, 0, 0);
-        c.surface_to_cache(1, 7, &rect(0, 0, 16, 16));
-        let cached = c.cache[&7].data.len();
-        assert!(cached > 0);
-
-        c.reset(1920, 1080);
-        assert_eq!(c.cache.len(), 1, "reset keeps the bitmap cache");
-        assert_eq!(
-            c.allocated_bytes, cached,
-            "only the cache's charge remains after a reset"
-        );
-
-        // The kept tile is still usable on a surface created after the reset.
-        c.create_surface(2, 16, 16);
-        c.map_surface(2, 0, 0);
-        c.cache_to_surface(7, 2, &[Point { x: 0, y: 0 }]);
-        c.end_frame();
-        assert_eq!(
-            c.drain_output().len(),
-            1,
-            "a cache paste after the reset still produces output"
-        );
-    }
-
-    /// A cache past the MS-RDPEGFX 3.3.1.4 cap is dropped on reset, so it cannot hold the
-    /// budget the surfaces created after the reset need.
-    #[test]
-    fn reset_drops_a_cache_over_the_protocol_cap() {
-        const EDGE: u16 = 4096; // 64 MiB per surface, and per full-surface tile
-        let mut c = Compositor::default();
-        c.reset(1920, 1080);
-        c.create_surface(1, EDGE, EDGE);
-        for slot in 0..2 {
-            c.surface_to_cache(1, slot, &rect(0, 0, EDGE, EDGE));
-        }
-        assert_eq!(c.cache.len(), 2);
-        assert!(c.cache.values().map(|tile| tile.data.len()).sum::<usize>() > MAX_BITMAP_CACHE_BYTES);
-
-        c.reset(1920, 1080);
-        assert!(c.cache.is_empty(), "a cache over the cap does not survive the reset");
-        assert_eq!(c.allocated_bytes, 0);
     }
 
     /// Cache slots are a second allocation pool keyed by `u16`. Charging them against

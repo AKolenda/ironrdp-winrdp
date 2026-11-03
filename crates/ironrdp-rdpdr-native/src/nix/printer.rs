@@ -634,14 +634,6 @@ mod tests {
     }
 
     #[test]
-    fn targets_parse_from_a_description() {
-        assert!(matches!(PrintTarget::parse("default"), PrintTarget::DefaultPrinter));
-        assert!(matches!(PrintTarget::parse(""), PrintTarget::DefaultPrinter));
-        assert!(matches!(PrintTarget::parse("HP_LaserJet"), PrintTarget::Printer(n) if n == "HP_LaserJet"));
-        assert!(matches!(PrintTarget::parse("folder:/tmp/out"), PrintTarget::Folder(p) if p == Path::new("/tmp/out")));
-    }
-
-    #[test]
     fn reset_discards_open_jobs() {
         let mut spooler = PrinterSpooler::new(PrintTarget::DefaultPrinter);
         let open = open_job(&mut spooler);

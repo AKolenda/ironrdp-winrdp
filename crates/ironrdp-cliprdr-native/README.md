@@ -28,14 +28,5 @@ Selection changes cancel older paste waiters, and the existing `ironrdp_cliprdr:
 The clipboard workers bound data transfers and pending pastes.
 X11 transfers use INCR for large content and separate requestor windows so late selection responses cannot complete newer reads.
 
-State-machine tests run in the normal CI suite with `cargo test -p ironrdp-testsuite-extra cliprdr_native`.
-Three additional integration tests require a dedicated X11 display; the interoperability test also requires `xclip`:
-
-```sh
-DISPLAY=:N cargo test -p ironrdp-testsuite-extra cliprdr_native::linux::x11_ -- --ignored --test-threads=1
-```
-
-Use a private display such as Xvfb for these tests, because they replace its clipboard selection.
-
 [`ext-data-control-v1`]: https://gitlab.freedesktop.org/wayland/wayland-protocols/-/blob/main/staging/ext-data-control/ext-data-control-v1.xml
 [`wlr-data-control-unstable-v1`]: https://gitlab.freedesktop.org/wlroots/wlr-protocols/-/blob/master/unstable/wlr-data-control-unstable-v1.xml
