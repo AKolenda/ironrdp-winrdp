@@ -43,6 +43,10 @@ pub struct ConnectionActivationSequence {
     // here (rather than duplicated into every state variant).
     io_channel_id: u16,
     user_channel_id: u16,
+    /// Set for a Deactivation-Reactivation Sequence, whose PDUs the session hands over
+    /// unfiltered. During the initial connection [`ClientConnector`](crate::ClientConnector)
+    /// handles the message channel itself.
+    message_channel_id: Option<u16>,
 }
 
 impl ConnectionActivationSequence {
@@ -56,6 +60,7 @@ impl ConnectionActivationSequence {
             config,
             io_channel_id,
             user_channel_id,
+            message_channel_id: None,
         }
     }
 
@@ -65,6 +70,44 @@ impl ConnectionActivationSequence {
 
     pub fn user_channel_id(&self) -> u16 {
         self.user_channel_id
+    }
+
+    /// Answers an RTT Measure Request that arrives on the MCS message channel while the
+    /// sequence waits for its PDU on the I/O channel, and ignores any other PDU there.
+    ///
+    /// The server keeps probing the connection during a Deactivation-Reactivation Sequence
+    /// ([MS-RDPBCGR] 3.2.5.14), and those requests are not the Share Control PDUs the
+    /// sequence decodes. A bandwidth measurement is not answered here: its window belongs to
+    /// the session.
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/16ffa852-8aa7-481c-99a0-36c1a9a198f6
+    fn step_message_channel_pdu(
+        &self,
+        input: &[u8],
+        output: &mut ironrdp_core::WriteBuf,
+    ) -> Option<ConnectorResult<Written>> {
+        let message_channel_id = self.message_channel_id?;
+        let ctx = ironrdp_pdu::mcs::decode_send_data_indication(input).ok()?;
+        if ctx.channel_id != message_channel_id {
+            return None;
+        }
+
+        let result = match crate::connection::auto_detect_request(ctx.user_data) {
+            Some(rdp::autodetect::AutoDetectRequest::RttRequest { sequence_number, .. }) => {
+                debug!(sequence_number, "Answering an RTT Measure Request during activation");
+                let response =
+                    rdp::autodetect::AutoDetectRspPdu::new(rdp::autodetect::AutoDetectResponse::RttResponse {
+                        sequence_number,
+                    });
+                crate::encode_send_data_request(self.user_channel_id, message_channel_id, &response, output)
+                    .and_then(Written::from_size)
+            }
+            request => {
+                debug!(?request, "Ignoring a message channel PDU during activation");
+                Ok(Written::Nothing)
+            }
+        };
+        Some(result)
     }
 
     /// Returns the current state as a distinct type, rather than `&dyn State` provided by [`Self::state`].
@@ -93,6 +136,7 @@ pub struct ConnectionActivationFactory {
     io_channel_id: u16,
     user_channel_id: u16,
     multitransport_soft_sync: bool,
+    message_channel_id: Option<u16>,
 }
 
 impl ConnectionActivationFactory {
@@ -102,7 +146,13 @@ impl ConnectionActivationFactory {
             io_channel_id,
             user_channel_id,
             multitransport_soft_sync: false,
+            message_channel_id: None,
         }
+    }
+
+    pub(crate) fn with_message_channel(mut self, message_channel_id: Option<u16>) -> Self {
+        self.message_channel_id = message_channel_id;
+        self
     }
 
     pub(crate) fn with_multitransport_soft_sync(mut self, multitransport_soft_sync: bool) -> Self {
@@ -125,7 +175,10 @@ impl ConnectionActivationFactory {
     /// Produces a fresh [`ConnectionActivationSequence`] in the initial `CapabilitiesExchange` state.
     #[must_use]
     pub fn create(&self) -> ConnectionActivationSequence {
-        ConnectionActivationSequence::new(self.config.clone(), self.io_channel_id, self.user_channel_id)
+        let mut sequence =
+            ConnectionActivationSequence::new(self.config.clone(), self.io_channel_id, self.user_channel_id);
+        sequence.message_channel_id = self.message_channel_id;
+        sequence
     }
 }
 
@@ -152,6 +205,14 @@ impl Sequence for ConnectionActivationSequence {
         received_at: Option<MonotonicInstant>,
         output: &mut ironrdp_core::WriteBuf,
     ) -> ConnectorResult<Written> {
+        if matches!(
+            self.state,
+            ConnectionActivationState::CapabilitiesExchange | ConnectionActivationState::ConnectionFinalization { .. }
+        ) && let Some(result) = self.step_message_channel_pdu(input, output)
+        {
+            return result;
+        }
+
         // The server may redirect the client instead of, or in the middle of, activating it
         // ([MS-RDPBCGR] 3.2.5.13.1).
         if matches!(

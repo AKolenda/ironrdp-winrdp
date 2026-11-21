@@ -1436,7 +1436,7 @@ fn security_header_contains(user_data: &[u8], flag: rdp::headers::BasicSecurityH
 /// answered either way. A server that waits for the answer (see the Bandwidth Measure
 /// Stop arm of `respond_to_connect_time_autodetect`) then stalls the handshake rather
 /// than seeing it end on a decode error.
-fn auto_detect_request(user_data: &[u8]) -> Option<rdp::autodetect::AutoDetectRequest> {
+pub(crate) fn auto_detect_request(user_data: &[u8]) -> Option<rdp::autodetect::AutoDetectRequest> {
     if !security_header_contains(user_data, rdp::headers::BasicSecurityHeaderFlags::AUTODETECT_REQ) {
         return None;
     }
@@ -2132,7 +2132,8 @@ impl Sequence for ClientConnector {
                                         connection_activation.io_channel_id(),
                                         connection_activation.user_channel_id(),
                                     )
-                                    .with_multitransport_soft_sync(self.soft_sync_negotiated()),
+                                    .with_multitransport_soft_sync(self.soft_sync_negotiated())
+                                    .with_message_channel(self.message_channel_id),
                                     compression_type: self.config.compression_type,
                                     server_rdp_version,
                                 },
