@@ -4797,10 +4797,17 @@ async fn active_session(
                 frame = reader.read_pdu() => {
                     let (action, payload) = match frame {
                         Ok(frame) => frame,
+                        // A server may acknowledge the shutdown request by closing the transport
+                        // instead of sending a Disconnect Provider Ultimatum, and some reset it.
+                        // A frame cut short is still a failure, and so is an unsolicited close.
                         Err(error)
                             if graceful_shutdown_sent
-                                && error.kind() == io::ErrorKind::UnexpectedEof
-                                && reader.peek().is_empty() =>
+                                && reader.peek().is_empty()
+                                && (error.kind() == io::ErrorKind::UnexpectedEof
+                                    || (matches!(
+                                        error.kind(),
+                                        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                                    ) && is_transport_read_error(&error))) =>
                         {
                             break 'outer GracefulDisconnectReason::UserInitiated;
                         }
